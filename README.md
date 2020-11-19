@@ -1,3 +1,5 @@
+![Go](https://github.com/nahojkap/ghmon/workflows/Go/badge.svg)
+
 # ghmon
 
 '_ghmon_' is a simple command line utility to monitor your open pull requests on Github.  It provides a simple UI to list the PRs that you have been requested to review, sorting them according to status, age and other criteria.
