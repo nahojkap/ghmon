@@ -16,7 +16,7 @@ type UI struct {
 	pullRequestBody *widgets.Paragraph
 	pullRequestList *widgets.List
 	reviewerList *widgets.List
-	pullRequests []PullRequest
+	pullRequests []*PullRequest
 }
 
 func NewGHMonUI(ghm *GHMon) *UI {
@@ -49,7 +49,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		ghui.render()
 	})
 
-	ghm.AddPullRequestListener(func (loadedPullRequests []PullRequest) {
+	ghm.AddPullRequestListener(func (loadedPullRequests map[uint32]*PullRequest) {
 
 		// FIXME: Should store currently selected PR and make sure
 		// FIXME: that is displayed (if still in the list) after loading
@@ -104,7 +104,7 @@ func (ghui *UI)UpdatePullRequestList(pullRequests []PullRequest) {
 }
 
 func (ghui *UI)UpdatePullRequestDetails(selectedPullRequest int) {
-	pullRequestItem := ghui.ghMon.pullRequests[selectedPullRequest]
+	pullRequestItem := ghui.ghMon.pullRequests[uint32(selectedPullRequest)]
 	ghui.pullRequestDetails.WrapText = false
 	ghui.pullRequestDetails.Text = fmt.Sprintf(" [ID](fg:15): %d\n [Title](fg:15): %s\n [Creator](fg:15): %s\n [Created](fg:15): %s\n [Updated](fg:15): %s", pullRequestItem.Id,pullRequestItem.Title, pullRequestItem.Creator.Username, pullRequestItem.CreatedAt, pullRequestItem.UpdatedAt)
 	ghui.pullRequestBody.Text = fmt.Sprintf("%s", pullRequestItem.Body)
@@ -124,7 +124,7 @@ func (ghui *UI)UpdatePullRequestDetails(selectedPullRequest int) {
 
 func (ghui *UI) openBrowser(selectedPullRequest int) {
 
-	pullRequestItem := ghui.ghMon.pullRequests[selectedPullRequest]
+	pullRequestItem := ghui.ghMon.pullRequests[uint32(selectedPullRequest)]
 	url := pullRequestItem.HtmlURL.String()
 	var err error
 
