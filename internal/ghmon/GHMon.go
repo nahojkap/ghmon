@@ -3,6 +3,7 @@ package ghmon
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/kelseyhightower/envconfig"
 	"io/ioutil"
 	"log"
 	"net/url"
@@ -10,12 +11,17 @@ import (
 	"time"
 )
 
+type Configuration struct {
+	Query string ``
+	RefreshInterval time.Duration `default:"15m" split_words:"true"`
+}
+
 type GHMon struct {
 	user                 *User
 	pullRequestListeners []func(pullRequests map[uint32]*PullRequest)
 	pullRequests map[uint32]*PullRequest
-
 	statusListeners      []func(status string)
+	configuration Configuration
 }
 
 type User struct {
@@ -53,6 +59,10 @@ type PullRequest struct {
 
 func NewGHMon() *GHMon {
 	ghm := GHMon{}
+	err := envconfig.Process("ghmon", &ghm.configuration)
+	if err != nil {
+		log.Fatal("Error extracting environment variables")
+	}
 	return &ghm
 }
 
@@ -212,17 +222,12 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequests map[uint32]*PullReque
 		go ghm.addPullRequestReviewers(pullRequests[pullRequestId])
 
 		if body, ok := item["body"]; ok {
-			pullRequests[pullRequestId].Body = body.(string)
+			if body != nil {
+				pullRequests[pullRequestId].Body = body.(string)
+			}
 		}
 
 	}
-
-	if len(ghm.pullRequests) > 0 {
-		for _, pullRequestListener := range ghm.pullRequestListeners {
-			pullRequestListener(ghm.pullRequests)
-		}
-	}
-
 
 }
 
@@ -231,11 +236,23 @@ func (ghm *GHMon) RetrievePullRequests() {
 	ghm.statusListeners[0]("fetching pull requests")
 	ghm.pullRequests = make(map[uint32]*PullRequest, 0)
 
-	// Need the set of PR that has been 'seen' by the user as well as those requested
-	result := MakeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-	ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
-	result = MakeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-	ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+	if ghm.configuration.Query != "" {
+		// Need the set of PR that has been 'seen' by the user as well as those requested
+		result := MakeAPIRequest("/search/issues?q=" + ghm.configuration.Query)
+		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+	} else {
+		// Need the set of PR that has been 'seen' by the user as well as those requested
+		result := MakeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
+		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+		result = MakeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
+		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+	}
+
+	if len(ghm.pullRequests) > 0 {
+		for _, pullRequestListener := range ghm.pullRequestListeners {
+			pullRequestListener(ghm.pullRequests)
+		}
+	}
 
 	ghm.statusListeners[0]("idle")
 
