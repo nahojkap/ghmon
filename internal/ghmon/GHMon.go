@@ -12,14 +12,17 @@ import (
 )
 
 type Configuration struct {
-	Query string ``
+	OwnQuery string ``
+	ReviewQuery string ``
 	RefreshInterval time.Duration `default:"15m" split_words:"true"`
 }
 
 type GHMon struct {
 	user                 *User
-	pullRequestListeners []func(pullRequests map[uint32]*PullRequest)
+	pullRequestListeners []func(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest)
+	singlePullRequestUpdatedListeners []func(pullRequest *PullRequest)
 	pullRequests map[uint32]*PullRequest
+	myPullRequests map[uint32]*PullRequest
 	statusListeners      []func(status string)
 	configuration Configuration
 }
@@ -29,15 +32,12 @@ type User struct {
 	Username string
 }
 
-func NewPullRequest(id uint32, title string ,htmURL string, pullRequestURL string, creator *User, createdAt time.Time, updatedAt time.Time) *PullRequest {
-	htmURLURL, err := url.Parse(htmURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pullRequestURLURL , err := url.Parse(pullRequestURL)
-	pullRequest := PullRequest{Id: id, Creator: creator, Title: title, Body: "", HtmlURL: htmURLURL, CreatedAt: createdAt, UpdatedAt: updatedAt, PullRequestURL: pullRequestURLURL}
-	return &pullRequest
-}
+type PullRequestType int
+
+const (
+	Own PullRequestType = iota
+	Reviewer
+)
 
 type PullRequestReview struct {
 	User *User
@@ -55,6 +55,7 @@ type PullRequest struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	PullRequestReviews map[uint32][]PullRequestReview
+	PullRequestType PullRequestType
 }
 
 func NewGHMon() *GHMon {
@@ -70,14 +71,18 @@ func (ghm *GHMon) AddStatusListener(statusListener func(statusUpdate string)) {
 	ghm.statusListeners = append(ghm.statusListeners, statusListener)
 }
 
+func (ghm *GHMon) AddPullRequestUpdatedListener(singlePullRequestListener func(pullRequest *PullRequest)) {
+	ghm.singlePullRequestUpdatedListeners = append(ghm.singlePullRequestUpdatedListeners, singlePullRequestListener)
+}
 
-func (ghm *GHMon) AddPullRequestListener(pullRequestListener func(pullRequests map[uint32]*PullRequest)) {
+func (ghm *GHMon) AddPullRequestListener(pullRequestListener func(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest)) {
 	ghm.pullRequestListeners = append(ghm.pullRequestListeners, pullRequestListener)
 }
 
 func (ghm *GHMon) monitorGithub() {
 	for {
 		go ghm.RetrievePullRequests()
+		go ghm.RetrieveMyPullRequests()
 		time.Sleep(15 * time.Minute)
 	}
 }
@@ -103,7 +108,7 @@ func (ghm *GHMon) HasValidSetup() bool {
 }
 
 
-func MakeAPIRequest(apiParams string) map[string]interface{} {
+func makeAPIRequest(apiParams string) map[string]interface{} {
 	cmd := exec.Command("gh","api", apiParams)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -181,7 +186,7 @@ func (ghm *GHMon) RetrieveUser() *User {
 	}
 
 	// Retrieve the current logged in user
-	result := MakeAPIRequest("/user")
+	result := makeAPIRequest("/user")
 
 	ghm.user = &User{uint32(result["id"].(float64)), result["login"].(string)}
 
@@ -190,7 +195,7 @@ func (ghm *GHMon) RetrieveUser() *User {
 
 }
 
-func (ghm *GHMon) parsePullRequestQueryResult(pullRequests map[uint32]*PullRequest, result map[string]interface{}) {
+func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest, result map[string]interface{}) {
 
 	pullRequestItems := result["items"].([]interface{})
 	count := len(pullRequestItems)
@@ -214,9 +219,22 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequests map[uint32]*PullReque
 
 		pullRequest := item["pull_request"].(map[string]interface{})
 
-		creator := &User{uint32(user["id"].(float64)),user["login"].(string)}
+		creator := &User{Id: uint32(user["id"].(float64)),Username: user["login"].(string)}
 
-		pullRequests[pullRequestId] = NewPullRequest(pullRequestId,item["title"].(string), item["html_url"].(string), pullRequest["url"].(string),creator, createdAt, updatedAt)
+		htmURLURL, err := url.Parse(item["html_url"].(string))
+		if err != nil {
+			log.Fatal(err)
+		}
+		pullRequestURLURL , err := url.Parse(pullRequest["url"].(string))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		pullRequests[pullRequestId] = &PullRequest {
+			Id: pullRequestId, Title: item["title"].(string), HtmlURL: htmURLURL, PullRequestURL: pullRequestURLURL,
+			Creator: creator, CreatedAt: createdAt, UpdatedAt: updatedAt,PullRequestType: pullRequestType,
+		}
+
 		ghm.statusListeners[0](fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id))
 
 		go ghm.addPullRequestReviewers(pullRequests[pullRequestId])
@@ -236,21 +254,21 @@ func (ghm *GHMon) RetrievePullRequests() {
 	ghm.statusListeners[0]("fetching pull requests")
 	ghm.pullRequests = make(map[uint32]*PullRequest, 0)
 
-	if ghm.configuration.Query != "" {
+	if ghm.configuration.ReviewQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := MakeAPIRequest("/search/issues?q=" + ghm.configuration.Query)
-		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
+		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
 	} else {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := MakeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
-		result = MakeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-		ghm.parsePullRequestQueryResult(ghm.pullRequests,result)
+		result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
+		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
+		result = makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
+		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
 	}
 
 	if len(ghm.pullRequests) > 0 {
 		for _, pullRequestListener := range ghm.pullRequestListeners {
-			pullRequestListener(ghm.pullRequests)
+			pullRequestListener(Reviewer,ghm.pullRequests)
 		}
 	}
 
@@ -258,10 +276,37 @@ func (ghm *GHMon) RetrievePullRequests() {
 
 }
 
+
+func (ghm *GHMon) RetrieveMyPullRequests() {
+
+	ghm.statusListeners[0]("fetching my pull requests")
+	ghm.myPullRequests = make(map[uint32]*PullRequest, 0)
+
+	if ghm.configuration.OwnQuery != "" {
+		// Need the set of PR that has been 'seen' by the user as well as those requested
+		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
+		ghm.parsePullRequestQueryResult(Own, ghm.myPullRequests,result)
+	} else {
+		// Need the set of PR that has been 'seen' by the user as well as those requested
+		result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
+		ghm.parsePullRequestQueryResult(Own,ghm.myPullRequests,result)
+	}
+
+	if len(ghm.myPullRequests) > 0 {
+		for _, pullRequestListener := range ghm.pullRequestListeners {
+			pullRequestListener(Own,ghm.myPullRequests)
+		}
+	}
+
+	ghm.statusListeners[0]("idle")
+
+}
+
+
 func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
 	// Use the pullRequest URL but strip out the https://api.github.com/ part
-	pullRequestResult := MakeAPIRequest(pullRequest.PullRequestURL.Path)
+	pullRequestResult := makeAPIRequest(pullRequest.PullRequestURL.Path)
 	requestedReviewers := pullRequestResult["requested_reviewers"].([]interface{})
 
 	pullRequest.PullRequestReviews = make(map[uint32][]PullRequestReview,0)
@@ -297,5 +342,10 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 		}
 
 	}
+
+	for _, singlePullRequestUpdateListener := range ghm.singlePullRequestUpdatedListeners {
+		singlePullRequestUpdateListener(pullRequest)
+	}
+
 
 }
