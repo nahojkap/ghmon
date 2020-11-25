@@ -12,8 +12,8 @@ import (
 )
 
 type Configuration struct {
-	OwnQuery string ``
-	ReviewQuery string ``
+	OwnQuery string `split_words:"true"`
+	ReviewQuery string `split_words:"true"`
 	RefreshInterval time.Duration `default:"15m" split_words:"true"`
 }
 
@@ -112,24 +112,23 @@ func makeAPIRequest(apiParams string) map[string]interface{} {
 	cmd := exec.Command("gh","api", apiParams)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error getting stdout pipe", err)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error starting gh", err)
 	}
 
 	b, _ := ioutil.ReadAll(stdout)
-	//out := string(b)
 
 	if err := cmd.Wait(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error waiting for gh to complete",err)
 	}
 
 	var result map[string]interface{}
 
 	err = json.Unmarshal(b, &result)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error unmarshalling response", err)
 	}
 	return result
 
@@ -139,22 +138,21 @@ func MakeAPIRequestForArray(apiParams string) []interface{} {
 	cmd := exec.Command("gh","api", apiParams)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error getting stdout pipe", err)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error starting gh", err)
 	}
 
 	b, _ := ioutil.ReadAll(stdout)
-	//out := string(b)
 
 	if err := cmd.Wait(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error waiting for gh to complete",err)
 	}
 
 	var result []interface{}
 	if err = json.Unmarshal(b, &result); err != nil {
-		log.Fatal("Unable to marshal JSON value")
+		log.Fatal("Error unmarshalling response", err)
 	}
 
 	return result
@@ -166,17 +164,17 @@ func (ghm *GHMon)IsLoggedIn() bool {
 	cmd := exec.Command("gh","auth", "status")
 	_, err := cmd.StderrPipe()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error getting stdout pipe", err)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error starting gh", err)
 	}
 
 	if err := cmd.Wait(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Error waiting for gh to complete",err)
 	}
 
-	return err == nil
+	return true
 }
 
 func (ghm *GHMon) RetrieveUser() *User {
@@ -223,11 +221,12 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 		htmURLURL, err := url.Parse(item["html_url"].(string))
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Could not parse HTML url", err)
+
 		}
 		pullRequestURLURL , err := url.Parse(pullRequest["url"].(string))
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Could not parse url", err)
 		}
 
 		pullRequests[pullRequestId] = &PullRequest {
