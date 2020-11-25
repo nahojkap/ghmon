@@ -66,6 +66,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	ui.StyleParserColorMap["lime"] = 10
 	ui.StyleParserColorMap["red3"] = 124
 	ui.StyleParserColorMap["orange3"] = 172
+	ui.StyleParserColorMap["yellow3"] = 184
 
 	reviewerTable.BorderStyle = ui.NewStyle(8)
 
@@ -211,6 +212,8 @@ func  (ghui *UI) pullRequestReviewStatusToInt(pullRequestReview PullRequestRevie
 		return 15
 	case "CHANGES_REQUESTED":
 		return 10
+	case "PENDING":
+		return 17
 	case "REQUESTED":
 		return 20
 	case "REJECTED":
@@ -227,6 +230,8 @@ func (ghui *UI) getPullRequestReviewColor(pullRequestView PullRequestReview) (co
 		color = "orange3"
 	case "CHANGES_REQUESTED":
 		color = "red3"
+	case "PENDING":
+		color = "yellow3"
 	case "REQUESTED":
 		color = "white"
 	default:
@@ -276,12 +281,12 @@ func (ghui *UI) getOverallPullRequestColor(pullRequest *PullRequest) string {
 		}
 	}
 
-	if approvals == len(pullRequestReviews) {
-		return "green"
-	}
-
 	if changesRequested != 0 {
 		return "red3"
+	}
+
+	if approvals == len(pullRequestReviews) {
+		return "green"
 	}
 
 	if comments > 0 {
