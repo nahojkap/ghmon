@@ -19,11 +19,9 @@ type Configuration struct {
 
 type GHMon struct {
 	user                 *User
-	pullRequestListeners []func(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest)
-	singlePullRequestUpdatedListeners []func(pullRequest *PullRequest)
 	pullRequests map[uint32]*PullRequest
 	myPullRequests map[uint32]*PullRequest
-	statusListeners      []func(status string)
+	events chan Event
 	configuration Configuration
 }
 
@@ -58,8 +56,24 @@ type PullRequest struct {
 	PullRequestType PullRequestType
 }
 
+type EventType int
+
+const (
+	Status EventType = iota
+	PullRequestsUpdates
+	PullRequestUpdated
+)
+
+
+type Event struct {
+	eventType EventType
+	payload interface{}
+}
+
 func NewGHMon() *GHMon {
 	ghm := GHMon{}
+
+	ghm.events = make(chan Event)
 	err := envconfig.Process("ghmon", &ghm.configuration)
 	if err != nil {
 		log.Fatal("Error extracting environment variables")
@@ -67,16 +81,8 @@ func NewGHMon() *GHMon {
 	return &ghm
 }
 
-func (ghm *GHMon) AddStatusListener(statusListener func(statusUpdate string)) {
-	ghm.statusListeners = append(ghm.statusListeners, statusListener)
-}
-
-func (ghm *GHMon) AddPullRequestUpdatedListener(singlePullRequestListener func(pullRequest *PullRequest)) {
-	ghm.singlePullRequestUpdatedListeners = append(ghm.singlePullRequestUpdatedListeners, singlePullRequestListener)
-}
-
-func (ghm *GHMon) AddPullRequestListener(pullRequestListener func(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest)) {
-	ghm.pullRequestListeners = append(ghm.pullRequestListeners, pullRequestListener)
+func (ghm *GHMon)Events() <-chan Event {
+	return ghm.events
 }
 
 func (ghm *GHMon) monitorGithub() {
@@ -90,9 +96,9 @@ func (ghm *GHMon) monitorGithub() {
 func (ghm *GHMon) Initialize() {
 
 	if ghm.IsLoggedIn() {
-		ghm.statusListeners[0]("logged in, retrieving user")
+		ghm.events <- Event{eventType: Status, payload: "logged in, retrieving user"}
 		user := ghm.RetrieveUser()
-		ghm.statusListeners[0](fmt.Sprintf("Running as %s", user.Username))
+		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("Running as %s", user.Username)}
 		go ghm.monitorGithub()
 	}
 }
@@ -198,7 +204,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 	pullRequestItems := result["items"].([]interface{})
 	count := len(pullRequestItems)
 
-	ghm.statusListeners[0](fmt.Sprintf("Fetched %d pull requests", count))
+	ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("Fetched %d pull requests", count)}
 
 	for _, pullRequestItem := range pullRequestItems {
 
@@ -234,7 +240,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			Creator: creator, CreatedAt: createdAt, UpdatedAt: updatedAt,PullRequestType: pullRequestType,
 		}
 
-		ghm.statusListeners[0](fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id))
+		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id)}
 
 		go ghm.addPullRequestReviewers(pullRequests[pullRequestId])
 
@@ -250,7 +256,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 func (ghm *GHMon) RetrievePullRequests() {
 
-	ghm.statusListeners[0]("fetching pull requests")
+	ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
 	ghm.pullRequests = make(map[uint32]*PullRequest, 0)
 
 	if ghm.configuration.ReviewQuery != "" {
@@ -266,19 +272,16 @@ func (ghm *GHMon) RetrievePullRequests() {
 	}
 
 	if len(ghm.pullRequests) > 0 {
-		for _, pullRequestListener := range ghm.pullRequestListeners {
-			pullRequestListener(Reviewer,ghm.pullRequests)
-		}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.pullRequests}
 	}
 
-	ghm.statusListeners[0]("idle")
-
+	ghm.events <- Event{eventType: Status, payload: "idle"}
 }
 
 
 func (ghm *GHMon) RetrieveMyPullRequests() {
 
-	ghm.statusListeners[0]("fetching my pull requests")
+	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
 	ghm.myPullRequests = make(map[uint32]*PullRequest, 0)
 
 	if ghm.configuration.OwnQuery != "" {
@@ -292,12 +295,10 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 	}
 
 	if len(ghm.myPullRequests) > 0 {
-		for _, pullRequestListener := range ghm.pullRequestListeners {
-			pullRequestListener(Own,ghm.myPullRequests)
-		}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.myPullRequests}
 	}
 
-	ghm.statusListeners[0]("idle")
+	ghm.events <- Event{eventType: Status, payload: "idle"}
 
 }
 
@@ -342,9 +343,5 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
 	}
 
-	for _, singlePullRequestUpdateListener := range ghm.singlePullRequestUpdatedListeners {
-		singlePullRequestUpdateListener(pullRequest)
-	}
-
-
+	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequest}
 }

@@ -8,16 +8,33 @@ import (
 	"os/exec"
 	"runtime"
 	"sort"
+	"time"
 )
 
 type PullRequestGroup struct {
 	pullRequestType 		PullRequestType
 	pullRequestList			*widgets.List
-	pullRequests            []*PullRequest
+	pullRequests            []*PullRequestWrapper
+}
+
+type PullRequestScore struct {
+	Approvals uint
+	Comments uint
+	ChangesRequested uint
+	NumReviewers uint
+}
+
+type PullRequestWrapper struct {
+	PullRequestType PullRequestType
+	FirstSeen time.Time
+	Seen bool
+	Score PullRequestScore
+	PullRequest *PullRequest
 }
 
 type UI struct {
 	ghMon                   *GHMon
+
 	status                  *widgets.Paragraph
 
 	pullRequestDetails      *widgets.Paragraph
@@ -86,76 +103,6 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	ghui.pullRequestGroups[0] = ghui.myPullRequestGroup
 	ghui.pullRequestGroups[1] = ghui.reviewPullRequestGroup
 
-	ghm.AddStatusListener(func (status string) {
-		ghui.status.Text = " " + status
-		ghui.renderStatus()
-	})
-
-	ghm.AddPullRequestUpdatedListener(func (pullRequest *PullRequest) {
-		currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-		if currentlySelectedPullRequestGroup.pullRequestType == pullRequest.PullRequestType {
-			ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequests, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
-		}
-	})
-
-	ghm.AddPullRequestListener(func (pullRequestType PullRequestType, loadedPullRequests map[uint32]*PullRequest) {
-
-		// FIXME: Should store currently selected PR and make sure
-		// FIXME: that is displayed (if still in the list) after loading
-		// FIXME: the new list of PRs
-
-		keys := make([]uint32,0)
-		for key := range loadedPullRequests {
-			keys = append(keys, key)
-		}
-		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-		var pullRequestGroup *PullRequestGroup
-		if pullRequestType == Reviewer {
-			pullRequestGroup = ghui.reviewPullRequestGroup
-		} else {
-			pullRequestGroup = ghui.myPullRequestGroup
-		}
-		pullRequests := pullRequestGroup.pullRequests
-		pullRequestList := pullRequestGroup.pullRequestList
-
-		newSelectedRow := 0
-		var currentlySelectedPullRequest *PullRequest
-		if len(pullRequests) > 0 {
-			currentlySelectedPullRequest = pullRequests[pullRequestList.SelectedRow]
-		}
-		numPRs := len(loadedPullRequests)
-		pullRequests = make([]*PullRequest,numPRs)
-		pullRequestList.Rows = make([]string, numPRs)
-		counter := 0
-		for _,key  := range keys {
-			pullRequestItem := loadedPullRequests[key]
-			var listLabel string
-			if currentlySelectedPullRequest != nil && pullRequestItem.Id == currentlySelectedPullRequest.Id {
-				newSelectedRow=counter
-				pullRequestList.SelectedRowStyle = ui.NewStyle(172,ColorListSelectedBackground)
-				listLabel = fmt.Sprintf(" %d  %s", pullRequestItem.Id, pullRequestItem.Title)
-			} else {
-				listLabel = fmt.Sprintf(" [%d  %s](fg:%s)", pullRequestItem.Id, pullRequestItem.Title, ghui.getOverallPullRequestColor(pullRequestItem))
-			}
-
-			pullRequestList.Rows[counter] = listLabel
-			pullRequests[counter] = pullRequestItem
-			counter++
-		}
-		pullRequestGroup.pullRequests = pullRequests
-		pullRequestList.SelectedRow = newSelectedRow
-
-		// If the current group being displayed is the same as this update, we also update the details
-		currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-		if pullRequestType == currentlySelectedPullRequestGroup.pullRequestType {
-			go ghui.UpdatePullRequestDetails(pullRequests, 0)
-		}
-
-		ghui.renderPullRequestLists()
-
-	})
-
 	return &ghui
 }
 
@@ -216,10 +163,9 @@ func  (ghui *UI) pullRequestReviewStatusToInt(pullRequestReview PullRequestRevie
 		return 17
 	case "REQUESTED":
 		return 20
-	case "REJECTED":
-		return 0
+	default:
+		return 50
 	}
-	return 50
 }
 
 func (ghui *UI) getPullRequestReviewColor(pullRequestView PullRequestReview) (color string) {
@@ -298,46 +244,37 @@ func (ghui *UI) getOverallPullRequestColor(pullRequest *PullRequest) string {
 
 }
 
-func (ghui *UI)UpdatePullRequestDetails(pullRequestList []*PullRequest, selectedPullRequest int) {
+func (ghui *UI)UpdatePullRequestDetails(pullRequestList []*PullRequestWrapper, selectedPullRequest int) {
 
 	if len(pullRequestList) == 0 {
 		return
 	}
 
-	pullRequestItem := pullRequestList[uint32(selectedPullRequest)]
+	pullRequestWrapper := pullRequestList[uint32(selectedPullRequest)]
 	ghui.pullRequestDetails.WrapText = false
-	ghui.pullRequestDetails.Text = fmt.Sprintf(" [ID](fg:white): %d\n [Title](fg:white): %s\n [Creator](fg:white): %s\n [Created](fg:white): %s\n [Updated](fg:white): %s", pullRequestItem.Id,pullRequestItem.Title, pullRequestItem.Creator.Username, pullRequestItem.CreatedAt, pullRequestItem.UpdatedAt)
-	ghui.pullRequestBody.Text = fmt.Sprintf("%s", pullRequestItem.Body)
+	ghui.pullRequestDetails.Text = fmt.Sprintf(" [ID](fg:white): %d\n [Title](fg:white): %s\n [Creator](fg:white): %s\n [Created](fg:white): %s\n [Updated](fg:white): %s", pullRequestWrapper.PullRequest.Id,pullRequestWrapper.PullRequest.Title, pullRequestWrapper.PullRequest.Creator.Username, pullRequestWrapper.PullRequest.CreatedAt, pullRequestWrapper.PullRequest.UpdatedAt)
+	ghui.pullRequestBody.Text = fmt.Sprintf("%s", pullRequestWrapper.PullRequest.Body)
 
 	ghui.reviewerTable.Rows = make([][]string, 0)
-	counter := 0
-
-	// FIXME: The reviewers should be sorted according to approved, commented, rejected etc
 
 	keys := make([]uint32,0)
-	for key := range pullRequestItem.PullRequestReviews {
+	for key := range pullRequestWrapper.PullRequest.PullRequestReviews {
 		keys = append(keys, key)
 	}
 
 	sort.Slice(keys, func(i, j int) bool {
-
-		left := ghui.extractMostImportantFirst(pullRequestItem.PullRequestReviews[keys[i]])
-		right := ghui.extractMostImportantFirst(pullRequestItem.PullRequestReviews[keys[j]])
-
+		left := ghui.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[i]])
+		right := ghui.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[j]])
 		return ghui.pullRequestReviewStatusToInt(left) < ghui.pullRequestReviewStatusToInt(right)
 	})
 
-
 	for _, key := range keys {
-		pullRequestReview := pullRequestItem.PullRequestReviews[key]
-
+		pullRequestReview := pullRequestWrapper.PullRequest.PullRequestReviews[key]
 		status := fmt.Sprintf("[%s](fg:%s)", pullRequestReview[0].Status, ghui.getPullRequestReviewColor(pullRequestReview[0]))
-
 		row := make([]string,2)
 		row[0] = status
 		row[1] = pullRequestReview[0].User.Username
 		ghui.reviewerTable.Rows = append(ghui.reviewerTable.Rows,row)
-		counter++
 	}
 
 	ghui.renderPullRequestDetails()
@@ -348,8 +285,9 @@ func (ghui *UI)UpdatePullRequestDetails(pullRequestList []*PullRequest, selected
 func (ghui *UI) openBrowser(selectedPullRequest int) {
 
 	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-	pullRequestItem := currentlySelectedPullRequestGroup.pullRequests[uint32(selectedPullRequest)]
-	url := pullRequestItem.HtmlURL.String()
+	pullRequest := currentlySelectedPullRequestGroup.pullRequests[uint32(selectedPullRequest)]
+	url := pullRequest.PullRequest.HtmlURL.String()
+
 	var err error
 
 	switch runtime.GOOS {
@@ -362,12 +300,106 @@ func (ghui *UI) openBrowser(selectedPullRequest int) {
 	default:
 		err = fmt.Errorf("unsupported platform")
 	}
+
 	if err != nil {
 		log.Fatal(err)
 	}
 
 }
 
+func (ghui *UI)handlePullRequestsUpdates(loadedPullRequests map[uint32]*PullRequest) {
+
+	// FIXME: Should store currently selected PR and make sure
+	// FIXME: that is displayed (if still in the list) after loading
+	// FIXME: the new list of PRs
+
+	keys := make([]uint32,0)
+	pullRequestType := Own
+	for key := range loadedPullRequests {
+		// FIXME: This needs to be more top-level really
+		pullRequestType = loadedPullRequests[key].PullRequestType
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	var pullRequestGroup *PullRequestGroup
+	if pullRequestType == Reviewer {
+		pullRequestGroup = ghui.reviewPullRequestGroup
+	} else {
+		pullRequestGroup = ghui.myPullRequestGroup
+	}
+
+	currentPullRequests := pullRequestGroup.pullRequests
+	pullRequestList := pullRequestGroup.pullRequestList
+
+	newSelectedRow := 0
+	var currentlySelectedPullRequest *PullRequest
+	if len(currentPullRequests) > 0 {
+		currentlySelectedPullRequest = currentPullRequests[pullRequestList.SelectedRow].PullRequest
+	}
+	numPRs := len(loadedPullRequests)
+
+
+	pullRequestWrappers := make([]*PullRequestWrapper,0)
+
+    //	pullRequests = make([]*PullRequest,numPRs)
+	pullRequestList.Rows = make([]string, numPRs)
+
+	counter := 0
+	for _,key  := range keys {
+		pullRequestItem := loadedPullRequests[key]
+		var listLabel string
+		if currentlySelectedPullRequest != nil && pullRequestItem.Id == currentlySelectedPullRequest.Id {
+			newSelectedRow=counter
+			pullRequestList.SelectedRowStyle = ui.NewStyle(172,ColorListSelectedBackground)
+			listLabel = fmt.Sprintf(" %d  %s", pullRequestItem.Id, pullRequestItem.Title)
+		} else {
+			listLabel = fmt.Sprintf(" [%d  %s](fg:%s)", pullRequestItem.Id, pullRequestItem.Title, ghui.getOverallPullRequestColor(pullRequestItem))
+		}
+
+		pullRequestList.Rows[counter] = listLabel
+		pullRequestWrappers = append(pullRequestWrappers,&PullRequestWrapper{PullRequestType: pullRequestItem.PullRequestType,PullRequest: pullRequestItem, Score: PullRequestScore{},Seen: false, FirstSeen:time.Now()})
+		counter++
+	}
+	pullRequestGroup.pullRequests = pullRequestWrappers
+	pullRequestList.SelectedRow = newSelectedRow
+
+	// If the current group being displayed is the same as this update, we also update the details
+	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
+	if pullRequestType == currentlySelectedPullRequestGroup.pullRequestType {
+		go ghui.UpdatePullRequestDetails(pullRequestWrappers, 0)
+	}
+
+	ghui.renderPullRequestLists()
+}
+
+func (ghui *UI) handlePullRequestUpdated(loadedPullRequest *PullRequest) {
+	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
+	if currentlySelectedPullRequestGroup.pullRequestType == loadedPullRequest.PullRequestType {
+		ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequests, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
+	}
+}
+
+func (ghui *UI) handleStatusUpdate(status string) {
+	ghui.status.Text = " " + status
+	ghui.renderStatus()
+}
+
+func (ghui *UI) pollEvents() {
+	events := ghui.ghMon.events
+	for {
+		event := <-events
+
+		switch event.eventType {
+		case PullRequestUpdated:
+			ghui.handlePullRequestUpdated(event.payload.(*PullRequest))
+		case PullRequestsUpdates:
+			ghui.handlePullRequestsUpdates(event.payload.(map[uint32]*PullRequest))
+		case Status:
+			ghui.handleStatusUpdate(event.payload.(string))
+		}
+	}
+}
 
 func (ghui *UI) EventLoop() {
 
@@ -382,6 +414,8 @@ func (ghui *UI) EventLoop() {
 
 	ghui.Resize(termHeight, termWidth)
 	ghui.renderAll()
+
+	go ghui.pollEvents()
 
 	previousKey := ""
 	uiEvents := ui.PollEvents()

@@ -2,7 +2,7 @@
 
 # ghmon
 
-'_ghmon_' is a simple command line utility written in Go that monitors your open pull requests on Github.  It provides a simple UI to list the PRs that you have been requested to review, sorting them according to status, age and other criteria.
+'_ghmon_' is a simple command line utility written in Go that monitors your pull requests on Github.  It provides a simple UI to list the PRs that you have opened as well as the ones which you have been requested to review, sorting them according to status, age and other criteria.
 
 At scheduled intervals, it will refresh the list of pull requests being monitored and update the UI accordingly.
 
@@ -12,7 +12,7 @@ While it is still work in progress, it aims to provide a quick overview of pendi
 
 # Prerequisites
 
-'_ghmon_' requires the GitHub CLI to be installed and authentication having been performed in order to work (see https://github.com/cli/cli).
+'_ghmon_' requires the GitHub CLI to be installed and for authentication having been done in order to work (see https://github.com/cli/cli).
 
 # Installing/Running
 
@@ -29,10 +29,10 @@ Ensure that you have _${GOPATH}/bin_ added to your path
 
 Key | Description
 ----|----
-r | Refreshes the current list
-TAB | Switched between "My Pull Requests" and "Active Review Request(s)" lists.
 Up/Down Arrows | Navigates the __active__ list
 Home/End | Goes to start/end of __active_ list respectively
+TAB | Switched between "My Pull Requests" and "Active Review Request(s)" lists.
+r | Refreshes the current list
 q | Exits _ghmon_
 
 # Configuration
