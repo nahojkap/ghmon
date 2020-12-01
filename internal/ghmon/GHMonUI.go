@@ -188,6 +188,11 @@ func (ghui *UI) getPullRequestReviewColor(pullRequestView PullRequestReview) (co
 
 func (ghui *UI)extractMostImportantFirst(pullRequestReviews []PullRequestReview) PullRequestReview {
 
+	// FIXME: The reviews need to be sorted by date as well - e.g. its possible to have an approval *after* a comment
+	// FIXME: and then another comment, which officially requires a re-review
+	// FIXME: Or should it be that the presence of any approval should be signalled differently and only be
+	// FIXME: cancelled if there is a request for change?
+
 	sort.Slice(pullRequestReviews, func (i, j int) bool {
 		return ghui.pullRequestReviewStatusToInt(pullRequestReviews[i]) < ghui.pullRequestReviewStatusToInt(pullRequestReviews[j])
 	})
@@ -364,18 +369,12 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequests map[uint32]*PullRequ
 	pullRequestGroup.pullRequests = pullRequestWrappers
 	pullRequestList.SelectedRow = newSelectedRow
 
-	// If the current group being displayed is the same as this update, we also update the details
-	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-	if pullRequestType == currentlySelectedPullRequestGroup.pullRequestType {
-		go ghui.UpdatePullRequestDetails(pullRequestWrappers, 0)
-	}
-
 	ghui.renderPullRequestLists()
 }
 
 func (ghui *UI) handlePullRequestUpdated(loadedPullRequest *PullRequest) {
 	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-	if currentlySelectedPullRequestGroup.pullRequestType == loadedPullRequest.PullRequestType {
+	if currentlySelectedPullRequestGroup.pullRequestType == loadedPullRequest.PullRequestType && loadedPullRequest.Id == currentlySelectedPullRequestGroup.pullRequests[currentlySelectedPullRequestGroup.pullRequestList.SelectedRow].PullRequest.Id {
 		ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequests, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
 	}
 }
@@ -389,7 +388,6 @@ func (ghui *UI) pollEvents() {
 	events := ghui.ghMon.events
 	for {
 		event := <-events
-
 		switch event.eventType {
 		case PullRequestUpdated:
 			ghui.handlePullRequestUpdated(event.payload.(*PullRequest))

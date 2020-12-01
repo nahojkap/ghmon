@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -54,6 +55,7 @@ type PullRequest struct {
 	UpdatedAt time.Time
 	PullRequestReviews map[uint32][]PullRequestReview
 	PullRequestType PullRequestType
+	Lock sync.Mutex
 }
 
 type EventType int
@@ -199,7 +201,7 @@ func (ghm *GHMon) RetrieveUser() *User {
 
 }
 
-func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest, result map[string]interface{}) {
+func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest, result map[string]interface{}, lock *sync.Mutex) {
 
 	pullRequestItems := result["items"].([]interface{})
 	count := len(pullRequestItems)
@@ -211,8 +213,10 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 		item := pullRequestItem.(map[string]interface{})
 		pullRequestId := uint32(item["id"].(float64))
 
+		lock.Lock()
 		// If we already have the item, loop around
 		if _,ok := pullRequests[pullRequestId]; ok {
+			lock.Unlock()
 			continue
 		}
 
@@ -221,7 +225,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 		createdAt,_ := time.Parse(time.RFC3339, item["created_at"].(string))
 		updatedAt,_ := time.Parse(time.RFC3339, item["updated_at"].(string))
 
-		pullRequest := item["pull_request"].(map[string]interface{})
+		pullRequestObj := item["pull_request"].(map[string]interface{})
 
 		creator := &User{Id: uint32(user["id"].(float64)),Username: user["login"].(string)}
 
@@ -230,25 +234,29 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			log.Fatal("Could not parse HTML url", err)
 
 		}
-		pullRequestURLURL , err := url.Parse(pullRequest["url"].(string))
+		pullRequestURLURL , err := url.Parse(pullRequestObj["url"].(string))
 		if err != nil {
 			log.Fatal("Could not parse url", err)
 		}
 
-		pullRequests[pullRequestId] = &PullRequest {
+		pullRequest := PullRequest {
 			Id: pullRequestId, Title: item["title"].(string), HtmlURL: htmURLURL, PullRequestURL: pullRequestURLURL,
 			Creator: creator, CreatedAt: createdAt, UpdatedAt: updatedAt,PullRequestType: pullRequestType,
 		}
+		if body, ok := item["body"]; ok {
+			if body != nil {
+				pullRequest.Body = body.(string)
+			}
+		}
+
+		pullRequests[pullRequestId] = &pullRequest
+
+		lock.Unlock()
 
 		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id)}
 
 		go ghm.addPullRequestReviewers(pullRequests[pullRequestId])
 
-		if body, ok := item["body"]; ok {
-			if body != nil {
-				pullRequests[pullRequestId].Body = body.(string)
-			}
-		}
 
 	}
 
@@ -259,16 +267,34 @@ func (ghm *GHMon) RetrievePullRequests() {
 	ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
 	ghm.pullRequests = make(map[uint32]*PullRequest, 0)
 
+	var lock sync.Mutex
 	if ghm.configuration.ReviewQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
-		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
+		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result, &lock)
 	} else {
-		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
-		result = makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result)
+
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(2)
+
+		retrieveRequestedPullRequests := func() {
+			// Need the set of PR that has been 'seen' by the user as well as those requested
+			result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
+			ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result, &lock)
+			waitGroup.Done()
+		}
+
+		retrieveReviewedByPullRequests := func() {
+			result := makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
+			ghm.parsePullRequestQueryResult(Reviewer, ghm.pullRequests, result, &lock)
+			waitGroup.Done()
+		}
+
+		go retrieveRequestedPullRequests()
+		go retrieveReviewedByPullRequests()
+
+		waitGroup.Wait()
+
 	}
 
 	if len(ghm.pullRequests) > 0 {
@@ -281,17 +307,18 @@ func (ghm *GHMon) RetrievePullRequests() {
 
 func (ghm *GHMon) RetrieveMyPullRequests() {
 
+	var lock sync.Mutex
 	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
 	ghm.myPullRequests = make(map[uint32]*PullRequest, 0)
 
 	if ghm.configuration.OwnQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
-		ghm.parsePullRequestQueryResult(Own, ghm.myPullRequests,result)
+		ghm.parsePullRequestQueryResult(Own, ghm.myPullRequests,result, &lock)
 	} else {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Own,ghm.myPullRequests,result)
+		ghm.parsePullRequestQueryResult(Own,ghm.myPullRequests,result, &lock)
 	}
 
 	if len(ghm.myPullRequests) > 0 {
@@ -305,43 +332,60 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 
 func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
-	// Use the pullRequest URL but strip out the https://api.github.com/ part
-	pullRequestResult := makeAPIRequest(pullRequest.PullRequestURL.Path)
-	requestedReviewers := pullRequestResult["requested_reviewers"].([]interface{})
-
 	pullRequest.PullRequestReviews = make(map[uint32][]PullRequestReview,0)
 
-	for _, requestedReviewerItem := range requestedReviewers {
-		requestedReviewer := requestedReviewerItem.(map[string]interface{})
-		id := uint32(requestedReviewer["id"].(float64))
-		if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-			pullRequest.PullRequestReviews[id] = make([]PullRequestReview,0)
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(2)
+
+	retriveReviewers := func() {
+		// Use the pullRequest URL but strip out the https://api.github.com/ part
+		pullRequestResult := makeAPIRequest(pullRequest.PullRequestURL.Path)
+		requestedReviewers := pullRequestResult["requested_reviewers"].([]interface{})
+
+		for _, requestedReviewerItem := range requestedReviewers {
+			requestedReviewer := requestedReviewerItem.(map[string]interface{})
+			id := uint32(requestedReviewer["id"].(float64))
+			user := &User{uint32(requestedReviewer["id"].(float64)), requestedReviewer["login"].(string)}
+
+			pullRequest.Lock.Lock()
+			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
+				pullRequest.PullRequestReviews[id] = make([]PullRequestReview,0)
+			}
+			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id],PullRequestReview{User: user,Status: "REQUESTED"})
+			pullRequest.Lock.Unlock()
 		}
-		user := &User{uint32(requestedReviewer["id"].(float64)), requestedReviewer["login"].(string)}
-		pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id],PullRequestReview{User: user,Status: "REQUESTED"})
+		waitGroup.Done()
 	}
 
-	pullRequestReviewResult := MakeAPIRequestForArray(pullRequest.PullRequestURL.Path + "/reviews")
-	for _, reviewItem := range pullRequestReviewResult {
-		requestedReviewer := reviewItem.(map[string]interface{})
-		user := requestedReviewer["user"].(map[string]interface{})
+	retriveReviews := func() {
+		pullRequestReviewResult := MakeAPIRequestForArray(pullRequest.PullRequestURL.Path + "/reviews")
+		for _, reviewItem := range pullRequestReviewResult {
+			requestedReviewer := reviewItem.(map[string]interface{})
+			user := requestedReviewer["user"].(map[string]interface{})
 
-		id := uint32(user["id"].(float64))
+			id := uint32(user["id"].(float64))
 
-		state := requestedReviewer["state"].(string)
-		pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: state}
+			state := requestedReviewer["state"].(string)
+			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: state}
+			if timeString, ok := requestedReviewer["submitted_at"].(string); ok {
+				pullRequestReview.SubmittedAt, _ = time.Parse(time.RFC3339, timeString)
+			}
 
-		if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-			pullRequest.PullRequestReviews[id] = make([]PullRequestReview,0)
+			pullRequest.Lock.Lock()
+			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
+				pullRequest.PullRequestReviews[id] = make([]PullRequestReview, 0)
+			}
+			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id], pullRequestReview)
+			pullRequest.Lock.Unlock()
+
 		}
-
-		pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id], pullRequestReview)
-
-		if timeString, ok := requestedReviewer["submitted_at"].(string); ok {
-			pullRequestReview.SubmittedAt,_ = time.Parse(time.RFC3339, timeString)
-		}
-
+		waitGroup.Done()
 	}
+
+	go retriveReviewers()
+	go retriveReviews()
+
+	waitGroup.Wait()
 
 	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequest}
 }
