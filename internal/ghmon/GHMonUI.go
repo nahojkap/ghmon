@@ -390,11 +390,11 @@ func (ghui *UI) pollEvents() {
 		event := <-events
 		switch event.eventType {
 		case PullRequestUpdated:
-			ghui.handlePullRequestUpdated(event.payload.(*PullRequest))
+			go ghui.handlePullRequestUpdated(event.payload.(*PullRequest))
 		case PullRequestsUpdates:
-			ghui.handlePullRequestsUpdates(event.payload.(map[uint32]*PullRequest))
+			go ghui.handlePullRequestsUpdates(event.payload.(map[uint32]*PullRequest))
 		case Status:
-			ghui.handleStatusUpdate(event.payload.(string))
+			go ghui.handleStatusUpdate(event.payload.(string))
 		}
 	}
 }

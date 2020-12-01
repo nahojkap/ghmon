@@ -32,6 +32,7 @@ Key | Description
 Up/Down Arrows | Navigates the __active__ list
 Home/End | Goes to start/end of __active_ list respectively
 TAB | Switched between "My Pull Requests" and "Active Review Request(s)" lists.
+ENTER | Opens the selected pull request in a browser
 r | Refreshes the current list
 q | Exits _ghmon_
 

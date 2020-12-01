@@ -74,8 +74,7 @@ type Event struct {
 
 func NewGHMon() *GHMon {
 	ghm := GHMon{}
-
-	ghm.events = make(chan Event)
+	ghm.events = make(chan Event,5)
 	err := envconfig.Process("ghmon", &ghm.configuration)
 	if err != nil {
 		log.Fatal("Error extracting environment variables")
