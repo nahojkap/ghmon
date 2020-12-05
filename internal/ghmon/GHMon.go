@@ -19,6 +19,7 @@ type Configuration struct {
 }
 
 type GHMon struct {
+	cachedRepoInformation map[*url.URL]*Repo
 	user                 *User
 	pullRequests map[uint32]*PullRequest
 	myPullRequests map[uint32]*PullRequest
@@ -44,8 +45,17 @@ type PullRequestReview struct {
 	SubmittedAt time.Time
 }
 
+type Repo struct {
+	Id uint32
+	Name string
+	FullName string
+	Description string
+	Url *url.URL
+}
+
 type PullRequest struct {
 	Id uint32
+	Repo *Repo
 	Creator *User
 	Title string
 	Body string
@@ -73,8 +83,10 @@ type Event struct {
 }
 
 func NewGHMon() *GHMon {
-	ghm := GHMon{}
-	ghm.events = make(chan Event,5)
+	ghm := GHMon{
+		cachedRepoInformation: make(map[*url.URL]*Repo,0),
+		events : make(chan Event,5),
+	}
 	err := envconfig.Process("ghmon", &ghm.configuration)
 	if err != nil {
 		log.Fatal("Error extracting environment variables")
@@ -128,6 +140,7 @@ func makeAPIRequest(apiParams string) map[string]interface{} {
 	b, _ := ioutil.ReadAll(stdout)
 
 	if err := cmd.Wait(); err != nil {
+		log.Printf("Error while waiting: %s", b)
 		log.Fatal("Error waiting for gh to complete",err)
 	}
 
@@ -200,6 +213,31 @@ func (ghm *GHMon) RetrieveUser() *User {
 
 }
 
+func (ghm *GHMon) getRepo(repoURL *url.URL) *Repo {
+
+	if repo, ok := ghm.cachedRepoInformation[repoURL]; ok {
+		return repo
+	}
+
+	// Use the URL but strip out the https://api.github.com/ part
+	result := makeAPIRequest(repoURL.Path)
+	id := uint32(result["id"].(float64))
+	name := result["name"].(string)
+	fullName := result["full_name"].(string)
+	repo := Repo{
+		Id: id, Name: name, FullName: fullName,
+	}
+	if description, ok := result["description"]; ok {
+		if description != nil {
+			repo.Description = description.(string)
+		}
+	}
+	ghm.cachedRepoInformation[repoURL] = &repo
+	return &repo
+
+}
+
+
 func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest, result map[string]interface{}, lock *sync.Mutex) {
 
 	pullRequestItems := result["items"].([]interface{})
@@ -238,9 +276,16 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			log.Fatal("Could not parse url", err)
 		}
 
+		repoURLURL , err := url.Parse(item["repository_url"].(string))
+		if err != nil {
+			log.Fatal("Could not parse repo url", err)
+		}
+		repo := ghm.getRepo(repoURLURL)
+
 		pullRequest := PullRequest {
 			Id: pullRequestId, Title: item["title"].(string), HtmlURL: htmURLURL, PullRequestURL: pullRequestURLURL,
 			Creator: creator, CreatedAt: createdAt, UpdatedAt: updatedAt,PullRequestType: pullRequestType,
+			Repo: repo,
 		}
 		if body, ok := item["body"]; ok {
 			if body != nil {
@@ -254,7 +299,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id)}
 
-		go ghm.addPullRequestReviewers(pullRequests[pullRequestId])
+		ghm.addPullRequestReviewers(pullRequests[pullRequestId])
 
 
 	}
@@ -264,13 +309,13 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 func (ghm *GHMon) RetrievePullRequests() {
 
 	ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
-	ghm.pullRequests = make(map[uint32]*PullRequest, 0)
+	pullRequests := make(map[uint32]*PullRequest, 0)
 
 	var lock sync.Mutex
 	if ghm.configuration.ReviewQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
-		ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Reviewer,pullRequests,result, &lock)
 	} else {
 
 		var waitGroup sync.WaitGroup
@@ -279,13 +324,13 @@ func (ghm *GHMon) RetrievePullRequests() {
 		retrieveRequestedPullRequests := func() {
 			// Need the set of PR that has been 'seen' by the user as well as those requested
 			result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer,ghm.pullRequests,result, &lock)
+			ghm.parsePullRequestQueryResult(Reviewer,pullRequests,result, &lock)
 			waitGroup.Done()
 		}
 
 		retrieveReviewedByPullRequests := func() {
 			result := makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer, ghm.pullRequests, result, &lock)
+			ghm.parsePullRequestQueryResult(Reviewer, pullRequests, result, &lock)
 			waitGroup.Done()
 		}
 
@@ -296,7 +341,9 @@ func (ghm *GHMon) RetrievePullRequests() {
 
 	}
 
-	if len(ghm.pullRequests) > 0 {
+	changesMade := len(pullRequests) != len(ghm.pullRequests)
+	ghm.pullRequests = pullRequests
+	if changesMade {
 		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.pullRequests}
 	}
 
@@ -308,19 +355,22 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 
 	var lock sync.Mutex
 	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
-	ghm.myPullRequests = make(map[uint32]*PullRequest, 0)
+	pullRequests := make(map[uint32]*PullRequest, 0)
 
 	if ghm.configuration.OwnQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
-		ghm.parsePullRequestQueryResult(Own, ghm.myPullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Own, pullRequests,result, &lock)
 	} else {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Own,ghm.myPullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Own,pullRequests,result, &lock)
 	}
 
-	if len(ghm.myPullRequests) > 0 {
+	changesMade := len(pullRequests) != len(ghm.myPullRequests)
+	ghm.myPullRequests = pullRequests
+
+	if changesMade {
 		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.myPullRequests}
 	}
 
