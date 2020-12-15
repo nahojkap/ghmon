@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os/exec"
+	"sort"
 	"sync"
 	"time"
 )
@@ -19,12 +20,12 @@ type Configuration struct {
 }
 
 type GHMon struct {
-	cachedRepoInformation map[*url.URL]*Repo
-	user                 *User
-	pullRequests map[uint32]*PullRequest
-	myPullRequests map[uint32]*PullRequest
-	events chan Event
-	configuration Configuration
+	cachedRepoInformation  map[*url.URL]*Repo
+	user                   *User
+	pullRequestWrappers    map[uint32]*PullRequestWrapper
+	myPullRequestsWrappers map[uint32]*PullRequestWrapper
+	events                 chan Event
+	configuration          Configuration
 }
 
 type User struct {
@@ -63,10 +64,30 @@ type PullRequest struct {
 	PullRequestURL *url.URL
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	PullRequestReviews map[uint32][]PullRequestReview
+	PullRequestReviews map[uint32][]*PullRequestReview
+	PullRequestReviewsByPriority [][]*PullRequestReview
 	PullRequestType PullRequestType
 	Lock sync.Mutex
 }
+
+type PullRequestScore struct {
+	Seen bool
+	AgeSec uint32
+	Approvals uint
+	Comments uint
+	ChangesRequested uint
+	NumReviewers uint
+}
+
+type PullRequestWrapper struct {
+	Id uint32
+	PullRequestType PullRequestType
+	FirstSeen time.Time
+	Seen bool
+	Score PullRequestScore
+	PullRequest *PullRequest
+}
+
 
 type EventType int
 
@@ -238,7 +259,7 @@ func (ghm *GHMon) getRepo(repoURL *url.URL) *Repo {
 }
 
 
-func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequests map[uint32]*PullRequest, result map[string]interface{}, lock *sync.Mutex) {
+func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequestsWrappers map[uint32]*PullRequestWrapper, result map[string]interface{}, lock *sync.Mutex) {
 
 	pullRequestItems := result["items"].([]interface{})
 	count := len(pullRequestItems)
@@ -252,7 +273,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 		lock.Lock()
 		// If we already have the item, loop around
-		if _,ok := pullRequests[pullRequestId]; ok {
+		if _,ok := pullRequestsWrappers[pullRequestId]; ok {
 			lock.Unlock()
 			continue
 		}
@@ -293,29 +314,169 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			}
 		}
 
-		pullRequests[pullRequestId] = &pullRequest
+		currentPullRequestWrapper := ghm.getCurrentPullRequestWrapper(pullRequest.Id)
+		pullRequestWrapper := ghm.mergePullRequestWrappers(&pullRequest, currentPullRequestWrapper)
+
+
+		pullRequestsWrappers[pullRequestId] = pullRequestWrapper
 
 		lock.Unlock()
 
-		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequests[pullRequestId].Id)}
+		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequestsWrappers[pullRequestId].Id)}
 
-		ghm.addPullRequestReviewers(pullRequests[pullRequestId])
+		go ghm.addPullRequestReviewers(pullRequestsWrappers[pullRequestId])
 
 
 	}
 
 }
 
+
+func  (ghm *GHMon) pullRequestReviewStatusToInt(pullRequestReview *PullRequestReview) int {
+	switch pullRequestReview.Status {
+	case "APPROVED":
+		return 12
+	case "COMMENTED":
+		return 15
+	case "CHANGES_REQUESTED":
+		return 10
+	case "PENDING":
+		return 17
+	case "REQUESTED":
+		return 20
+	default:
+		return 50
+	}
+}
+
+
+func (ghm *GHMon)extractMostImportantFirst(pullRequestReviews []*PullRequestReview) *PullRequestReview {
+
+	// FIXME: The reviews need to be sorted by date as well - e.g. its possible to have an approval *after* a comment
+	// FIXME: and then another comment, which officially requires a re-review
+	// FIXME: Or should it be that the presence of any approval should be signalled differently and only be
+	// FIXME: cancelled if there is a request for change?
+
+	sort.Slice(pullRequestReviews, func (i, j int) bool {
+		if (pullRequestReviews[i].Status == "APPROVED" || pullRequestReviews[i].Status == "CHANGES_REQUESTED") && (pullRequestReviews[j].Status == "APPROVED" || pullRequestReviews[j].Status == "CHANGES_REQUESTED") {
+			return pullRequestReviews[i].SubmittedAt.After(pullRequestReviews[j].SubmittedAt)
+		}
+		return ghm.pullRequestReviewStatusToInt(pullRequestReviews[i]) < ghm.pullRequestReviewStatusToInt(pullRequestReviews[j])
+	})
+
+	return pullRequestReviews[0]
+
+}
+
+
+func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper) {
+
+	pullRequestScore := PullRequestScore{}
+
+	importantPullRequestReviews := make([]*PullRequestReview, 0)
+	for _, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviews {
+		pullRequestReview := ghm.extractMostImportantFirst(pullRequestReviews)
+		importantPullRequestReviews = append(importantPullRequestReviews, pullRequestReview)
+	}
+
+	pullRequestScore.NumReviewers = uint(len(importantPullRequestReviews))
+	pullRequestScore.Seen = pullRequestWrapper.Seen
+	pullRequestScore.AgeSec = uint32(time.Now().Unix() - pullRequestWrapper.FirstSeen.Unix())
+
+	for _, pullRequestReview := range importantPullRequestReviews {
+		switch pullRequestReview.Status {
+		case "APPROVED" : pullRequestScore.Approvals++
+		case "CHANGES_REQUESTED" : pullRequestScore.ChangesRequested++
+		case "COMMENTED" : pullRequestScore.Comments++
+		}
+	}
+
+	pullRequestWrapper.Score = pullRequestScore
+
+}
+
+
+func (ghm *GHMon) calculateScore(pullRequestScore PullRequestScore) int {
+
+	if pullRequestScore.ChangesRequested > 0 {
+		return -1
+	}
+
+	if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
+		return 100
+	}
+
+	if pullRequestScore.Comments > 0 {
+		return 50
+	}
+
+	return 150
+}
+
+func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullRequestWrapper {
+
+	for _, pullRequestWrapper := range ghm.pullRequestWrappers {
+		if pullRequestWrapper.Id == pullRequestId {
+			return pullRequestWrapper
+		}
+	}
+	for _, pullRequestWrapper := range ghm.myPullRequestsWrappers {
+		if pullRequestWrapper.Id == pullRequestId {
+			return pullRequestWrapper
+		}
+	}
+	return nil
+}
+
+func (ghm *GHMon) mergePullRequestWrappers(pullRequest *PullRequest, currentPullRequestWrapper *PullRequestWrapper) *PullRequestWrapper {
+	pullRequestWrapper := PullRequestWrapper{Id: pullRequest.Id, PullRequestType: pullRequest.PullRequestType, PullRequest: pullRequest, Score: PullRequestScore{}, Seen: false, FirstSeen: time.Now()}
+	if currentPullRequestWrapper != nil {
+		pullRequestWrapper.FirstSeen = currentPullRequestWrapper.FirstSeen
+		pullRequestWrapper.Score = currentPullRequestWrapper.Score
+		pullRequestWrapper.Seen = currentPullRequestWrapper.Seen
+	}
+	ghm.updatePullRequestScore(&pullRequestWrapper)
+	return &pullRequestWrapper
+}
+
+func (ghm *GHMon) sortPullRequestWrappers(pullRequestWrappers map[uint32]*PullRequestWrapper) []*PullRequestWrapper {
+
+	sortedPullRequestWrappers := make([]*PullRequestWrapper, 0)
+	for _, loadedPullRequest  := range pullRequestWrappers {
+		sortedPullRequestWrappers = append(sortedPullRequestWrappers, loadedPullRequest)
+	}
+
+	sort.Slice(sortedPullRequestWrappers, func(i,j int) bool {
+
+		left := sortedPullRequestWrappers[i]
+		right := sortedPullRequestWrappers[j]
+
+		leftScore := ghm.calculateScore(left.Score)
+		rightScore := ghm.calculateScore(right.Score)
+
+		if leftScore == rightScore {
+			return left.PullRequest.Id < right.PullRequest.Id
+		}
+
+		return leftScore < rightScore
+
+	})
+
+	return sortedPullRequestWrappers
+
+}
+
+
 func (ghm *GHMon) RetrievePullRequests() {
 
 	ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
-	pullRequests := make(map[uint32]*PullRequest, 0)
+	pullRequestWrappers := make(map[uint32]*PullRequestWrapper, 0)
 
 	var lock sync.Mutex
 	if ghm.configuration.ReviewQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
-		ghm.parsePullRequestQueryResult(Reviewer,pullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Reviewer,pullRequestWrappers,result, &lock)
 	} else {
 
 		var waitGroup sync.WaitGroup
@@ -324,13 +485,13 @@ func (ghm *GHMon) RetrievePullRequests() {
 		retrieveRequestedPullRequests := func() {
 			// Need the set of PR that has been 'seen' by the user as well as those requested
 			result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer,pullRequests,result, &lock)
+			ghm.parsePullRequestQueryResult(Reviewer,pullRequestWrappers,result, &lock)
 			waitGroup.Done()
 		}
 
 		retrieveReviewedByPullRequests := func() {
 			result := makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer, pullRequests, result, &lock)
+			ghm.parsePullRequestQueryResult(Reviewer, pullRequestWrappers, result, &lock)
 			waitGroup.Done()
 		}
 
@@ -341,10 +502,12 @@ func (ghm *GHMon) RetrievePullRequests() {
 
 	}
 
-	changesMade := len(pullRequests) != len(ghm.pullRequests)
-	ghm.pullRequests = pullRequests
+	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
+
+	changesMade := len(pullRequestWrappers) != len(ghm.pullRequestWrappers)
+	ghm.pullRequestWrappers = pullRequestWrappers
 	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.pullRequests}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: sortedPullRequestWrappers}
 	}
 
 	ghm.events <- Event{eventType: Status, payload: "idle"}
@@ -355,23 +518,25 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 
 	var lock sync.Mutex
 	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
-	pullRequests := make(map[uint32]*PullRequest, 0)
+	pullRequestWrappers := make(map[uint32]*PullRequestWrapper, 0)
 
 	if ghm.configuration.OwnQuery != "" {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
-		ghm.parsePullRequestQueryResult(Own, pullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Own, pullRequestWrappers,result, &lock)
 	} else {
 		// Need the set of PR that has been 'seen' by the user as well as those requested
 		result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Own,pullRequests,result, &lock)
+		ghm.parsePullRequestQueryResult(Own,pullRequestWrappers,result, &lock)
 	}
 
-	changesMade := len(pullRequests) != len(ghm.myPullRequests)
-	ghm.myPullRequests = pullRequests
+	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
+
+	changesMade := len(pullRequestWrappers) != len(ghm.myPullRequestsWrappers)
+	ghm.myPullRequestsWrappers = pullRequestWrappers
 
 	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: ghm.myPullRequests}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: sortedPullRequestWrappers}
 	}
 
 	ghm.events <- Event{eventType: Status, payload: "idle"}
@@ -379,9 +544,10 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 }
 
 
-func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
+func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
-	pullRequest.PullRequestReviews = make(map[uint32][]PullRequestReview,0)
+	pullRequest := pullRequestWrapper.PullRequest
+	pullRequest.PullRequestReviews = make(map[uint32][]*PullRequestReview,0)
 
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(2)
@@ -398,9 +564,9 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
 			pullRequest.Lock.Lock()
 			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-				pullRequest.PullRequestReviews[id] = make([]PullRequestReview,0)
+				pullRequest.PullRequestReviews[id] = make([]*PullRequestReview,0)
 			}
-			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id],PullRequestReview{User: user,Status: "REQUESTED"})
+			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id],&PullRequestReview{User: user,Status: "REQUESTED"})
 			pullRequest.Lock.Unlock()
 		}
 		waitGroup.Done()
@@ -422,9 +588,9 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
 			pullRequest.Lock.Lock()
 			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-				pullRequest.PullRequestReviews[id] = make([]PullRequestReview, 0)
+				pullRequest.PullRequestReviews[id] = make([]*PullRequestReview, 0)
 			}
-			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id], pullRequestReview)
+			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id], &pullRequestReview)
 			pullRequest.Lock.Unlock()
 
 		}
@@ -436,5 +602,36 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequest *PullRequest) {
 
 	waitGroup.Wait()
 
-	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequest}
+	ghm.sortPullRequestReviewers(pullRequestWrapper)
+	ghm.updatePullRequestScore(pullRequestWrapper)
+
+	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
+}
+
+func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
+
+	keys := make([]uint32,0)
+	for key := range pullRequestWrapper.PullRequest.PullRequestReviews {
+		keys = append(keys, key)
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		left := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[i]])
+		right := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[j]])
+
+		leftToInt := ghm.pullRequestReviewStatusToInt(left)
+		rightToInt := ghm.pullRequestReviewStatusToInt(right)
+
+		if leftToInt == rightToInt {
+			return left.User.Id < right.User.Id
+		}
+		return leftToInt < rightToInt
+	})
+
+	sortedPullRequestReviews := make([][]*PullRequestReview, 0)
+	for _,key := range keys {
+		sortedPullRequestReviews = append(sortedPullRequestReviews, pullRequestWrapper.PullRequest.PullRequestReviews[key])
+	}
+	pullRequestWrapper.PullRequest.PullRequestReviewsByPriority = sortedPullRequestReviews
+
 }
