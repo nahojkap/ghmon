@@ -97,6 +97,10 @@ const (
 	PullRequestUpdated
 )
 
+type PullRequestsUpdatesEvent struct {
+	pullRequestType     PullRequestType
+	pullRequestWrappers []*PullRequestWrapper
+}
 
 type Event struct {
 	eventType EventType
@@ -507,7 +511,7 @@ func (ghm *GHMon) RetrievePullRequests() {
 	changesMade := len(pullRequestWrappers) != len(ghm.pullRequestWrappers)
 	ghm.pullRequestWrappers = pullRequestWrappers
 	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: sortedPullRequestWrappers}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers}}
 	}
 
 	ghm.events <- Event{eventType: Status, payload: "idle"}
@@ -536,7 +540,7 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 	ghm.myPullRequestsWrappers = pullRequestWrappers
 
 	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: sortedPullRequestWrappers}
+		ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType : Own, pullRequestWrappers: sortedPullRequestWrappers}}
 	}
 
 	ghm.events <- Event{eventType: Status, payload: "idle"}
