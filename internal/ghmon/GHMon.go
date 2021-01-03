@@ -7,10 +7,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+	"github.com/kirsle/configdir"
 )
 
 type Configuration struct {
@@ -20,12 +23,16 @@ type Configuration struct {
 }
 
 type GHMon struct {
-	cachedRepoInformation  map[*url.URL]*Repo
-	user                   *User
-	pullRequestWrappers    map[uint32]*PullRequestWrapper
-	myPullRequestsWrappers map[uint32]*PullRequestWrapper
-	events                 chan Event
-	configuration          Configuration
+	configPath              string
+	cachedPullRequestFolder string
+	cachedRepoInformation   map[*url.URL]*Repo
+	user                    *User
+	pullRequestWrappers     map[uint32]*PullRequestWrapper
+	myPullRequestsWrappers  map[uint32]*PullRequestWrapper
+	events                  chan Event
+	configuration           Configuration
+	store                   *GHMonStorage
+	logger                  *log.Logger
 }
 
 type User struct {
@@ -55,22 +62,23 @@ type Repo struct {
 }
 
 type PullRequest struct {
-	Id uint32
-	Repo *Repo
-	Creator *User
-	Title string
-	Body string
-	HtmlURL *url.URL
-	PullRequestURL *url.URL
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	PullRequestReviews map[uint32][]*PullRequestReview
+	Id                           uint32
+	Repo                         *Repo
+	Creator                      *User
+	Title                        string
+	Body                         string
+	HtmlURL                      *url.URL
+	PullRequestURL               *url.URL
+	CreatedAt                    time.Time
+	UpdatedAt                    time.Time
+	PullRequestReviewsByUser     map[uint32][]*PullRequestReview
 	PullRequestReviewsByPriority [][]*PullRequestReview
-	PullRequestType PullRequestType
-	Lock sync.Mutex
+	PullRequestType              PullRequestType
+	Lock                         sync.Mutex
 }
 
 type PullRequestScore struct {
+	Total float32
 	Seen bool
 	AgeSec uint32
 	Approvals uint
@@ -108,18 +116,54 @@ type Event struct {
 }
 
 func NewGHMon() *GHMon {
-	ghm := GHMon{
-		cachedRepoInformation: make(map[*url.URL]*Repo,0),
-		events : make(chan Event,5),
-	}
-	err := envconfig.Process("ghmon", &ghm.configuration)
+
+	var configuration Configuration
+	err := envconfig.Process("ghmon", &configuration)
 	if err != nil {
 		log.Fatal("Error extracting environment variables")
 	}
+
+	configPath := configdir.LocalConfig("ghmon")
+	err = configdir.MakePath(configPath)
+	if err != nil {
+		panic(err)
+	}
+
+	cachedPullRequestFolder := filepath.Join(configPath, "pull-requests")
+	err = configdir.MakePath(cachedPullRequestFolder)
+	if err != nil {
+		panic(err)
+	}
+
+	logDirectory := filepath.Join(configPath,"logs")
+	err = configdir.MakePath(logDirectory)
+	if err != nil {
+		panic(err)
+	}
+	logFile := filepath.Join(logDirectory, "ghmon.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	// defer f.Close()
+
+	logger := log.New(f, "ghmon", log.LstdFlags)
+
+	ghm := GHMon{
+		cachedRepoInformation: make(map[*url.URL]*Repo,0),
+		events : make(chan Event,5),
+		store: &GHMonStorage{
+			cachedPullRequestFolder: cachedPullRequestFolder,
+		},
+		cachedPullRequestFolder: cachedPullRequestFolder,
+		configPath: configPath,
+		logger : logger,
+	}
+
 	return &ghm
 }
 
-func (ghm *GHMon)Events() <-chan Event {
+func (ghm *GHMon) Events() <-chan Event {
 	return ghm.events
 }
 
@@ -145,7 +189,7 @@ func (ghm *GHMon) HasValidSetup() bool {
 
 	_,err := exec.LookPath("gh")
 	if err != nil {
-		log.Fatal("installing 'gh' is in your future ...\n")
+		log.Fatal("installing 'gh' is in your future ...")
 		return false
 	}
 	return true
@@ -153,6 +197,7 @@ func (ghm *GHMon) HasValidSetup() bool {
 
 
 func makeAPIRequest(apiParams string) map[string]interface{} {
+
 	cmd := exec.Command("gh","api", apiParams)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -206,6 +251,7 @@ func MakeAPIRequestForArray(apiParams string) []interface{} {
 
 func (ghm *GHMon)IsLoggedIn() bool {
 
+	ghm.logger.Println("Checking logged in status")
 	cmd := exec.Command("gh","auth", "status")
 	_, err := cmd.StderrPipe()
 	if err != nil {
@@ -321,7 +367,6 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 		currentPullRequestWrapper := ghm.getCurrentPullRequestWrapper(pullRequest.Id)
 		pullRequestWrapper := ghm.mergePullRequestWrappers(&pullRequest, currentPullRequestWrapper)
 
-
 		pullRequestsWrappers[pullRequestId] = pullRequestWrapper
 
 		lock.Unlock()
@@ -378,7 +423,7 @@ func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper)
 	pullRequestScore := PullRequestScore{}
 
 	importantPullRequestReviews := make([]*PullRequestReview, 0)
-	for _, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviews {
+	for _, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByUser {
 		pullRequestReview := ghm.extractMostImportantFirst(pullRequestReviews)
 		importantPullRequestReviews = append(importantPullRequestReviews, pullRequestReview)
 	}
@@ -429,7 +474,11 @@ func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullReques
 			return pullRequestWrapper
 		}
 	}
-	return nil
+
+	channel := ghm.store.LoadPullRequestWrapper(pullRequestId)
+
+	return <-channel
+
 }
 
 func (ghm *GHMon) mergePullRequestWrappers(pullRequest *PullRequest, currentPullRequestWrapper *PullRequestWrapper) *PullRequestWrapper {
@@ -551,12 +600,12 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
 	pullRequest := pullRequestWrapper.PullRequest
-	pullRequest.PullRequestReviews = make(map[uint32][]*PullRequestReview,0)
+	pullRequest.PullRequestReviewsByUser = make(map[uint32][]*PullRequestReview,0)
 
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(2)
 
-	retriveReviewers := func() {
+	retrieveRequestedReviewers := func() {
 		// Use the pullRequest URL but strip out the https://api.github.com/ part
 		pullRequestResult := makeAPIRequest(pullRequest.PullRequestURL.Path)
 		requestedReviewers := pullRequestResult["requested_reviewers"].([]interface{})
@@ -567,16 +616,16 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 			user := &User{uint32(requestedReviewer["id"].(float64)), requestedReviewer["login"].(string)}
 
 			pullRequest.Lock.Lock()
-			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-				pullRequest.PullRequestReviews[id] = make([]*PullRequestReview,0)
+			if _, ok := pullRequest.PullRequestReviewsByUser[id]; !ok {
+				pullRequest.PullRequestReviewsByUser[id] = make([]*PullRequestReview,0)
 			}
-			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id],&PullRequestReview{User: user,Status: "REQUESTED"})
+			pullRequest.PullRequestReviewsByUser[id] = append(pullRequest.PullRequestReviewsByUser[id],&PullRequestReview{User: user,Status: "REQUESTED"})
 			pullRequest.Lock.Unlock()
 		}
 		waitGroup.Done()
 	}
 
-	retriveReviews := func() {
+	retrieveReviews := func() {
 		pullRequestReviewResult := MakeAPIRequestForArray(pullRequest.PullRequestURL.Path + "/reviews")
 		for _, reviewItem := range pullRequestReviewResult {
 			requestedReviewer := reviewItem.(map[string]interface{})
@@ -591,23 +640,26 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 			}
 
 			pullRequest.Lock.Lock()
-			if _, ok := pullRequest.PullRequestReviews[id]; !ok {
-				pullRequest.PullRequestReviews[id] = make([]*PullRequestReview, 0)
+			if _, ok := pullRequest.PullRequestReviewsByUser[id]; !ok {
+				pullRequest.PullRequestReviewsByUser[id] = make([]*PullRequestReview, 0)
 			}
-			pullRequest.PullRequestReviews[id] = append(pullRequest.PullRequestReviews[id], &pullRequestReview)
+			pullRequest.PullRequestReviewsByUser[id] = append(pullRequest.PullRequestReviewsByUser[id], &pullRequestReview)
 			pullRequest.Lock.Unlock()
 
 		}
 		waitGroup.Done()
 	}
 
-	go retriveReviewers()
-	go retriveReviews()
+	go retrieveRequestedReviewers()
+	go retrieveReviews()
+
+	// FIXME: Should also retrieve comments directly on the ticket here ...
 
 	waitGroup.Wait()
 
 	ghm.sortPullRequestReviewers(pullRequestWrapper)
 	ghm.updatePullRequestScore(pullRequestWrapper)
+	go ghm.store.StorePullRequestWrapper(pullRequestWrapper)
 
 	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
 }
@@ -615,13 +667,13 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
 	keys := make([]uint32,0)
-	for key := range pullRequestWrapper.PullRequest.PullRequestReviews {
+	for key := range pullRequestWrapper.PullRequest.PullRequestReviewsByUser {
 		keys = append(keys, key)
 	}
 
 	sort.Slice(keys, func(i, j int) bool {
-		left := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[i]])
-		right := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviews[keys[j]])
+		left := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[i]])
+		right := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[j]])
 
 		leftToInt := ghm.pullRequestReviewStatusToInt(left)
 		rightToInt := ghm.pullRequestReviewStatusToInt(right)
@@ -634,7 +686,7 @@ func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrappe
 
 	sortedPullRequestReviews := make([][]*PullRequestReview, 0)
 	for _,key := range keys {
-		sortedPullRequestReviews = append(sortedPullRequestReviews, pullRequestWrapper.PullRequest.PullRequestReviews[key])
+		sortedPullRequestReviews = append(sortedPullRequestReviews, pullRequestWrapper.PullRequest.PullRequestReviewsByUser[key])
 	}
 	pullRequestWrapper.PullRequest.PullRequestReviewsByPriority = sortedPullRequestReviews
 
