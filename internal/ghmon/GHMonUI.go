@@ -7,7 +7,6 @@
 		"log"
 		"os/exec"
 		"runtime"
-		"strconv"
 		"strings"
 		"sync"
 	)
@@ -49,9 +48,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	// reviewPullRequestTable.SetTitle("Active Pull Request(s)")
 
 	reviewerTable := tview.NewTable()
-
 	pullRequestDetails := tview.NewTable()
-
 	pullRequestBody := tview.NewTextView()
 
 	status := tview.NewTextView()
@@ -60,31 +57,31 @@ func NewGHMonUI(ghm *GHMon) *UI {
 
 	monitoring := tview.NewTextView()
 	monitoring.SetTextAlign(tview.AlignLeft)
-	monitoring.SetText("monitoring 5 (out of 6) pull requests")
+	monitoring.SetText("Your Pull Requests")
 
 	grid := tview.NewGrid().
 		SetRows(5, 0, 0, 0, 1).
-		SetColumns(-2,-1, 20).
+		SetColumns(-2,-1).
 		SetBorders(true)
 
 	grid.AddItem(status, 4, 0, 1, 2, 0, 0, false)
-	grid.AddItem(monitoring, 4, 2, 1, 1, 0, 0, false)
+	grid.AddItem(monitoring, 0, 0, 1, 1, 0, 0, false)
 
 	// Layout for screens narrower than 100 cells (menu and side bar are hidden).
-	grid.AddItem(myReviewPullRequestTable, 0, 0, 2, 1, 0, 0, false)
+	grid.AddItem(myReviewPullRequestTable, 1, 0, 2, 1, 0, 0, false)
 	grid.AddItem(reviewPullRequestTable, 2, 0, 2, 1, 0, 0, false)
 
-	grid.AddItem(pullRequestDetails, 0, 1, 1, 2, 0, 0, false)
-	grid.AddItem(reviewerTable, 1, 1, 1, 2, 0, 0, false)
-	grid.AddItem(pullRequestBody, 2, 1, 2, 2, 0, 0, false)
+	grid.AddItem(pullRequestDetails, 0, 1, 1, 1, 0, 0, false)
+	grid.AddItem(reviewerTable, 1, 1, 1, 1, 0, 0, false)
+	grid.AddItem(pullRequestBody, 2, 1, 2, 1, 0, 0, false)
 
 	// Layout for screens wider than 100 cells.
-	grid.AddItem(myReviewPullRequestTable, 0, 0, 2, 1, 0, 100, false)
+	grid.AddItem(myReviewPullRequestTable, 1, 0, 2, 1, 0, 100, false)
 	grid.AddItem(reviewPullRequestTable, 2, 0, 2, 1, 0, 100, false)
 
-	grid.AddItem(pullRequestDetails, 0, 1, 1, 2, 0, 100, false)
-	grid.AddItem(reviewerTable, 1, 1, 1, 2, 0, 100, false)
-	grid.AddItem(pullRequestBody, 2, 1, 2, 2, 0, 100, false)
+	grid.AddItem(pullRequestDetails, 0, 1, 1, 1, 0, 100, false)
+	grid.AddItem(reviewerTable, 1, 1, 1, 1, 0, 100, false)
+	grid.AddItem(pullRequestBody, 2, 1, 2, 1, 0, 100, false)
 
 	app := tview.NewApplication()
 	grid.SetBackgroundColor(tcell.ColorBlack)
@@ -421,15 +418,7 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 		}
 	}
 
-	// currentPullRequests := pullRequestGroup.pullRequestWrappers
 	pullRequestTable := pullRequestGroup.pullRequestTable
-
-	//var currentlySelectedPullRequest *PullRequest
-	//if len(currentPullRequests) > 0 {
-	//	row, _ := pullRequestTable.GetSelection()
-	//	currentlySelectedPullRequest = currentPullRequests[row].PullRequest
-	//}
-
 	currentlySelectedPullRequest := pullRequestGroup.currentlySelectedPullRequestWrapper
 	newSelectedRow := 0
 
@@ -449,10 +438,9 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 		}
 
 		pullRequestTable.SetCell(counter,0, tview.NewTableCell(seen))
-		pullRequestTable.SetCell(counter,1, tview.NewTableCell(strconv.FormatUint(uint64(pullRequestItem.Id),10)))
-		pullRequestTable.SetCell(counter,2, tview.NewTableCell(pullRequestItem.Repo.Name))
-		pullRequestTable.SetCell(counter,3, tview.NewTableCell(pullRequestItem.Title))
-		pullRequestTable.SetCell(counter,4, tview.NewTableCell(pullRequestItem.UpdatedAt.String()))
+		pullRequestTable.SetCell(counter,1, tview.NewTableCell(pullRequestItem.Title))
+		pullRequestTable.SetCell(counter,2, tview.NewTableCell(fmt.Sprintf("[%s]",pullRequestItem.Repo.Name)))
+		pullRequestTable.SetCell(counter,3, tview.NewTableCell(pullRequestItem.UpdatedAt.String()))
 
 		counter++
 	}
