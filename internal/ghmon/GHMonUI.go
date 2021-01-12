@@ -9,6 +9,7 @@
 		"runtime"
 		"strings"
 		"sync"
+		"time"
 	)
 
 type PullRequestGroup struct {
@@ -38,6 +39,9 @@ type UI struct {
 
 	pullRequestGroups []*PullRequestGroup
 	currentFocusedPullRequestGroup int
+
+	timerCanceled chan bool
+
 }
 
 func NewGHMonUI(ghm *GHMon) *UI {
@@ -55,33 +59,39 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	status.SetTextAlign(tview.AlignLeft)
 	status.SetText("")
 
-	monitoring := tview.NewTextView()
-	monitoring.SetTextAlign(tview.AlignLeft)
-	monitoring.SetText("Your Pull Requests")
+	yourPullRequestLabel := tview.NewTextView()
+	yourPullRequestLabel.SetTextAlign(tview.AlignLeft)
+	yourPullRequestLabel.SetText("Your Pull Request(s)")
+
+	reviewPullRequestLabel := tview.NewTextView()
+	reviewPullRequestLabel.SetTextAlign(tview.AlignLeft)
+	reviewPullRequestLabel.SetText("Pending Review Request(s)")
 
 	grid := tview.NewGrid().
-		SetRows(5, 0, 0, 0, 1).
+		SetRows(1,4,10, 1, 0, 1).
 		SetColumns(-2,-1).
 		SetBorders(true)
 
-	grid.AddItem(status, 4, 0, 1, 2, 0, 0, false)
-	grid.AddItem(monitoring, 0, 0, 1, 1, 0, 0, false)
+	grid.AddItem(yourPullRequestLabel, 0, 0, 1, 1, 0, 0, false)
+	grid.AddItem(reviewPullRequestLabel, 3, 0, 1, 1, 0, 0, false)
 
 	// Layout for screens narrower than 100 cells (menu and side bar are hidden).
-	grid.AddItem(myReviewPullRequestTable, 1, 0, 2, 1, 0, 0, false)
-	grid.AddItem(reviewPullRequestTable, 2, 0, 2, 1, 0, 0, false)
+	// grid.AddItem(myReviewPullRequestTable, 1, 0, 1, 1, 0, 0, false)
+	// grid.AddItem(reviewPullRequestTable, 2, 0, 2, 1, 0, 0, false)
 
-	grid.AddItem(pullRequestDetails, 0, 1, 1, 1, 0, 0, false)
-	grid.AddItem(reviewerTable, 1, 1, 1, 1, 0, 0, false)
-	grid.AddItem(pullRequestBody, 2, 1, 2, 1, 0, 0, false)
+	// grid.AddItem(pullRequestDetails, 0, 1, 2, 1, 0, 0, false)
+	// grid.AddItem(reviewerTable, 2, 1, 1, 1, 0, 0, false)
+	// grid.AddItem(pullRequestBody, 3, 1, 2, 1, 0, 0, false)
 
 	// Layout for screens wider than 100 cells.
 	grid.AddItem(myReviewPullRequestTable, 1, 0, 2, 1, 0, 100, false)
-	grid.AddItem(reviewPullRequestTable, 2, 0, 2, 1, 0, 100, false)
+	grid.AddItem(reviewPullRequestTable, 4, 0, 1, 1, 0, 100, false)
 
-	grid.AddItem(pullRequestDetails, 0, 1, 1, 1, 0, 100, false)
-	grid.AddItem(reviewerTable, 1, 1, 1, 1, 0, 100, false)
-	grid.AddItem(pullRequestBody, 2, 1, 2, 1, 0, 100, false)
+	grid.AddItem(pullRequestDetails, 0, 1, 2, 1, 0, 100, false)
+	grid.AddItem(reviewerTable, 2, 1, 1, 1, 0, 100, false)
+	grid.AddItem(pullRequestBody, 3, 1, 2	, 1, 0, 100, false)
+
+	grid.AddItem(status, 5, 0, 1, 2, 0, 0, false)
 
 	app := tview.NewApplication()
 	grid.SetBackgroundColor(tcell.ColorBlack)
@@ -90,6 +100,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		ghMon: ghm,app: app, grid: grid, reviewerTable: reviewerTable,
 		status: status, pullRequestDetails: pullRequestDetails,
 		pullRequestBody:  pullRequestBody,
+		timerCanceled: make(chan bool,1),
 	}
 
 	ghui.reviewPullRequestGroup = &PullRequestGroup{pullRequestType: Reviewer, pullRequestTable: reviewPullRequestTable}
@@ -99,7 +110,6 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	ghui.pullRequestGroups[0] = ghui.myPullRequestGroup
 	ghui.pullRequestGroups[1] = ghui.reviewPullRequestGroup
 
-	app.SetFocus(myReviewPullRequestTable)
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		// We navigate in between focuses here
 		if event.Key() == tcell.KeyTab {
@@ -123,6 +133,10 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		return event
 	})
 
+	app.SetMouseCapture(func(event *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
+		return event, action
+	})
+
 	myReviewPullRequestTable.Select(0, 0).SetFixed(1, 1).SetDoneFunc(func(key tcell.Key) {
 	}).SetSelectedFunc(func(row int, column int) {
 		ghui.openBrowser(row)
@@ -132,13 +146,12 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	})
 	myReviewPullRequestTable.SetSelectable(true,false)
 	myReviewPullRequestTable.SetSelectionChangedFunc(func(row, column int) {
-		if row >= 0 {
-			ghui.updateSelectedPullRequestWrapper(ghui.pullRequestGroups[0], row)
-			go app.QueueUpdateDraw(func() {
-				ghui.UpdatePullRequestDetails(ghui.pullRequestGroups[0])
-			})
-		}
+		ghui.handlePullRequestSelectionChanged(ghui.pullRequestGroups[0], row)
 	})
+	myReviewPullRequestTable.SetMouseCapture(func(action tview.MouseAction,event *tcell.EventMouse) (tview.MouseAction,*tcell.EventMouse) {
+		return action,nil
+	})
+
 	reviewPullRequestTable.Select(0, 0).SetFixed(1, 1).SetDoneFunc(func(key tcell.Key) {
 		// What here?
 	}).SetSelectedFunc(func(row int, column int) {
@@ -149,15 +162,79 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		return event
 	})
 	reviewPullRequestTable.SetSelectionChangedFunc(func(row, column int) {
-		if row >= 0 {
-			ghui.updateSelectedPullRequestWrapper(ghui.pullRequestGroups[1], row)
-			go app.QueueUpdateDraw(func() {
-				ghui.UpdatePullRequestDetails(ghui.pullRequestGroups[1])
-			})
-		}
+		ghui.handlePullRequestSelectionChanged(ghui.pullRequestGroups[1], row)
+	})
+	reviewPullRequestTable.SetMouseCapture(func(action tview.MouseAction,event *tcell.EventMouse) (tview.MouseAction,*tcell.EventMouse) {
+		return action,nil
 	})
 
+	ghui.UpdateAccordingToFocus(ghui.myPullRequestGroup)
+
 	return &ghui
+}
+
+func (ghui *UI) getCurrentlySelectedPullRequest() *PullRequestWrapper {
+	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
+	return currentlySelectedPullRequestGroup.currentlySelectedPullRequestWrapper
+}
+
+func (ghui *UI) handlePullRequestSelectionChanged(pullRequestGroup *PullRequestGroup, row int) {
+
+	if len(pullRequestGroup.pullRequestWrappers) > 0 && row >= 0 {
+
+		ghui.updateSelectedPullRequestWrapper(pullRequestGroup, row)
+
+		go ghui.handlePullRequestSelected(pullRequestGroup.currentlySelectedPullRequestWrapper)
+
+		go ghui.app.QueueUpdateDraw(func() {
+			ghui.UpdatePullRequestDetails(pullRequestGroup)
+		})
+	}
+}
+
+
+func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
+
+	select {
+		case <-time.After(5 * time.Second):
+			// do something for timeout, like change state
+			ghui.ghMon.Logger().Printf("Seen timer timeout for %d", pullRequestWrapper.Id)
+			// if current pull request is still the same one as we started 'seeing'
+			currentlySelectedPullRequest := ghui.getCurrentlySelectedPullRequest()
+			if currentlySelectedPullRequest != nil && currentlySelectedPullRequest.Id == pullRequestWrapper.Id {
+				ghui.ghMon.Logger().Printf("Marking %d as seen", pullRequestWrapper.Id)
+				currentlySelectedPullRequest.Seen = true
+
+				ghui.app.QueueUpdateDraw(func() {
+					ghui.handlePullRequestsUpdates(ghui.getPullRequestGroup(pullRequestWrapper).pullRequestWrappers)
+				})
+
+			}
+
+		case <-ghui.timerCanceled:
+			// aborted
+			ghui.ghMon.Logger().Printf("Timer cancelled for %d", pullRequestWrapper.Id)
+
+	}
+
+}
+
+func (ghui *UI) handlePullRequestSelected(pullRequestWrapper *PullRequestWrapper) {
+
+	ghui.ghMon.Logger().Printf("Selected pull request %d", pullRequestWrapper.Id)
+	ghui.ghMon.Logger().Printf("Pull Request Seen? %t", pullRequestWrapper.Seen)
+
+	// FIXME: Slightly weird since we essentially throw away the channel each time
+	ghui.timerCanceled <- true
+	ghui.timerCanceled = make(chan bool, 1)
+
+	if !pullRequestWrapper.Seen {
+		ghui.ghMon.Logger().Printf("%d not seen, will start timer", pullRequestWrapper.Id)
+		go ghui.startSeenTimer(pullRequestWrapper)
+	} else {
+		ghui.ghMon.Logger().Printf("%d already seen, will not start new timer", pullRequestWrapper.Id)
+	}
+
 }
 
 func (ghui *UI) updateSelectedPullRequestWrapper(pullRequestGroup *PullRequestGroup, index int) {
@@ -168,48 +245,46 @@ func (ghui *UI) updateSelectedPullRequestWrapper(pullRequestGroup *PullRequestGr
 }
 
 func (ghui *UI) setUnfocused(pullRequestGroup *PullRequestGroup) {
-	//pullRequestGroup.pullRequestList.BorderStyle = ui.NewStyle(8)
-	//pullRequestGroup.pullRequestList.TitleStyle = ui.NewStyle(8, ui.ColorClear, ui.ModifierClear)
-	//
-	//color := ui.ColorClear
-	//if len(pullRequestGroup.pullRequestWrappers) > 0 {
-	//	color = ghui.getOverallPullRequestColor(pullRequestGroup.pullRequestWrappers[pullRequestGroup.pullRequestList.SelectedRow])
-	//}
-	//pullRequestGroup.pullRequestList.SelectedRowStyle = ui.NewStyle(color, ColorListNotSelectedBackground)
+
+	pullRequestGroup.pullRequestTable.SetSelectedStyle(tcell.Style.Background(tcell.StyleDefault,tcell.Color237))
+
+	go ghui.app.QueueUpdateDraw(func() {
+		ghui.handlePullRequestSelectionChanged(pullRequestGroup, pullRequestGroup.currentlySelectedPullRequestWrapperIndex)
+	})
+
+
 }
 
 func (ghui *UI) setFocused(pullRequestGroup *PullRequestGroup) {
-	//pullRequestGroup.pullRequestList.BorderStyle = ui.NewStyle(ui.ColorWhite)
-	//pullRequestGroup.pullRequestList.TitleStyle = ui.NewStyle(ui.ColorWhite, ui.ColorClear, ui.ModifierBold)
-	//color := ui.ColorClear
-	//if len(pullRequestGroup.pullRequestWrappers) > 0 {
-	//	color = ghui.getOverallPullRequestColor(pullRequestGroup.pullRequestWrappers[pullRequestGroup.pullRequestList.SelectedRow])
-	//}
-	//pullRequestGroup.pullRequestList.SelectedRowStyle = ui.NewStyle(color, ColorListSelectedBackground, ui.ModifierBold)
+
+	ghui.app.SetFocus(pullRequestGroup.pullRequestTable)
+	pullRequestGroup.pullRequestTable.SetSelectedStyle(tcell.StyleDefault)
+
+	go ghui.app.QueueUpdateDraw(func() {
+		ghui.handlePullRequestSelectionChanged(pullRequestGroup, pullRequestGroup.currentlySelectedPullRequestWrapperIndex)
+	})
 
 }
 
-//func (ghui *UI) UpdateAccordingToFocus(pullRequestGroup *PullRequestGroup) {
-//	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-//	if currentlySelectedPullRequestGroup == pullRequestGroup {
-//		ghui.setFocused(pullRequestGroup)
-//	} else {
-//		ghui.setUnfocused(pullRequestGroup)
-//	}
-//
-//}
+func (ghui *UI) UpdateAccordingToFocus(pullRequestGroup *PullRequestGroup) {
+	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
+	if currentlySelectedPullRequestGroup == pullRequestGroup {
+		ghui.setFocused(pullRequestGroup)
+	} else {
+		ghui.setUnfocused(pullRequestGroup)
+	}
+}
 
 
 func (ghui *UI) NewFocus() {
 
+	currentSelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
 	ghui.currentFocusedPullRequestGroup++
 	nextSelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
 
-	ghui.app.SetFocus(nextSelectedPullRequestGroup.pullRequestTable)
+	ghui.UpdateAccordingToFocus(currentSelectedPullRequestGroup)
+	ghui.UpdateAccordingToFocus(nextSelectedPullRequestGroup)
 
-	go ghui.app.QueueUpdateDraw(func() {
-		go ghui.UpdatePullRequestDetails(nextSelectedPullRequestGroup)
-	})
 }
 
 func (ghui *UI) RefreshPullRequests() {
@@ -304,13 +379,12 @@ func (ghui *UI)escapeSquareBracketsInString(str string) string {
 
 	inSquareBracket := false
 	for _,r := range str {
-		s := string(r)
 		switch r {
 		case '[' :
 			if !inSquareBracket {
 				inSquareBracket = true
 			}
-			b.WriteString(s)
+			b.WriteRune(r)
 		case ']' :
 			if inSquareBracket {
 				inSquareBracket = false
@@ -335,7 +409,7 @@ func (ghui *UI)UpdatePullRequestDetails(pullRequestGroup *PullRequestGroup) {
 	pullRequestWrapper := pullRequestWrappers[uint32(pullRequestGroup.currentlySelectedPullRequestWrapperIndex)]
 
 	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]Title:"))
-	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",pullRequestWrapper.PullRequest.Title)))
+	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",ghui.escapeSquareBracketsInString(pullRequestWrapper.PullRequest.Title))))
 	ghui.pullRequestDetails.SetCell(1,0,tview.NewTableCell(" [::b]Creator: "))
 	ghui.pullRequestDetails.SetCell(1,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a]%s",pullRequestWrapper.PullRequest.Creator.Username)))
 	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Created: "))
@@ -382,14 +456,15 @@ func (ghui *UI) openBrowser(selectedPullRequest int) {
 
 }
 
-func padToLen(str string, requiredLen int) string {
-	paddedString := str
-	for len(paddedString) < requiredLen {
-		paddedString += " "
+func (ghui *UI) getPullRequestGroup(pullRequestWrapper *PullRequestWrapper) *PullRequestGroup {
+	var pullRequestGroup *PullRequestGroup
+	if pullRequestWrapper.PullRequestType == Reviewer {
+		pullRequestGroup = ghui.reviewPullRequestGroup
+	} else {
+		pullRequestGroup = ghui.myPullRequestGroup
 	}
-	return paddedString
+	return pullRequestGroup
 }
-
 
 func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullRequestWrapper) {
 
@@ -397,19 +472,7 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 		return
 	}
 
-	// FIXME: Somewhat clunky way of figuring out the type of review being submitted
-	pullRequestType := Reviewer
-	for key := range loadedPullRequestWrappers {
-		pullRequestType = loadedPullRequestWrappers[key].PullRequestType
-		break
-	}
-
-	var pullRequestGroup *PullRequestGroup
-	if pullRequestType == Reviewer {
-		pullRequestGroup = ghui.reviewPullRequestGroup
-	} else {
-		pullRequestGroup = ghui.myPullRequestGroup
-	}
+	pullRequestGroup := ghui.getPullRequestGroup(loadedPullRequestWrappers[0])
 
 	longestRepoName := 0
 	for _,pullRequestWrapper := range loadedPullRequestWrappers {
@@ -438,7 +501,7 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 		}
 
 		pullRequestTable.SetCell(counter,0, tview.NewTableCell(seen))
-		pullRequestTable.SetCell(counter,1, tview.NewTableCell(pullRequestItem.Title))
+		pullRequestTable.SetCell(counter,1, tview.NewTableCell(ghui.escapeSquareBracketsInString(pullRequestItem.Title)))
 		pullRequestTable.SetCell(counter,2, tview.NewTableCell(fmt.Sprintf("[%s]",pullRequestItem.Repo.Name)))
 		pullRequestTable.SetCell(counter,3, tview.NewTableCell(pullRequestItem.UpdatedAt.String()))
 
@@ -446,11 +509,9 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 	}
 
 	pullRequestGroup.pullRequestWrappers = loadedPullRequestWrappers
-	ghui.updateSelectedPullRequestWrapper(pullRequestGroup, newSelectedRow)
 
-	go ghui.app.QueueUpdateDraw(func() {
-		ghui.UpdatePullRequestDetails(pullRequestGroup)
-	})
+	go ghui.UpdateAccordingToFocus(pullRequestGroup)
+	go ghui.handlePullRequestSelectionChanged(pullRequestGroup, newSelectedRow)
 
 }
 
@@ -491,30 +552,6 @@ func (ghui *UI) pollEvents() {
 
 
 func (ghui *UI) EventLoop() {
-
-	//pullRequestsTable.Select(0, 0).SetFixed(1, 1).SetDoneFunc(func(key tcell.Key) {
-	//	if key == tcell.KeyEscape {
-	//		app.Stop()
-	//	}
-	//	if key == tcell.KeyEnter {
-	//		pullRequestsTable.SetSelectable(true, false)
-	//	}
-	//}).SetSelectedFunc(func(row int, column int) {
-	//	pullRequestsTable.GetCell(row, column).SetTextColor(tcell.ColorRed)
-	//	pullRequestsTable.SetSelectable(false, false)
-	//})
-	//
-	//myPullRequestsTable.Select(0, 0).SetFixed(1, 1).SetDoneFunc(func(key tcell.Key) {
-	//	if key == tcell.KeyEscape {
-	//		app.Stop()
-	//	}
-	//	if key == tcell.KeyEnter {
-	//		myPullRequestsTable.SetSelectable(true, false)
-	//	}
-	//}).SetSelectedFunc(func(row int, column int) {
-	//	myPullRequestsTable.GetCell(row, column).SetTextColor(tcell.ColorRed)
-	//	myPullRequestsTable.SetSelectable(false, false)
-	//})
 
 	go ghui.pollEvents()
 
