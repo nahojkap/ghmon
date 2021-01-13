@@ -451,6 +451,10 @@ func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper)
 
 }
 
+func (ghm *GHMon) MarkSeen(pullRequestWrapper *PullRequestWrapper) {
+	pullRequestWrapper.Seen = true
+	go ghm.store.StorePullRequestWrapper(pullRequestWrapper)
+}
 
 func (ghm *GHMon) calculateScore(pullRequestScore PullRequestScore) int {
 

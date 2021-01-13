@@ -203,7 +203,7 @@ func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
 			currentlySelectedPullRequest := ghui.getCurrentlySelectedPullRequest()
 			if currentlySelectedPullRequest != nil && currentlySelectedPullRequest.Id == pullRequestWrapper.Id {
 				ghui.ghMon.Logger().Printf("Marking %d as seen", pullRequestWrapper.Id)
-				currentlySelectedPullRequest.Seen = true
+				ghui.ghMon.MarkSeen(pullRequestWrapper)
 
 				ghui.app.QueueUpdateDraw(func() {
 					ghui.handlePullRequestsUpdates(ghui.getPullRequestGroup(pullRequestWrapper).pullRequestWrappers)
