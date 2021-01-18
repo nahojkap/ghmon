@@ -332,13 +332,19 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 		pullRequestId := uint32(item["id"].(float64))
 
 		user := item["user"].(map[string]interface{})
+		userID := uint32(user["id"].(float64))
+
+		if pullRequestType == Reviewer && userID == ghm.user.Id {
+			ghm.logger.Printf("Filtering out %d from list of reviewer", pullRequestId)
+			continue
+		}
 
 		createdAt,_ := time.Parse(time.RFC3339, item["created_at"].(string))
 		updatedAt,_ := time.Parse(time.RFC3339, item["updated_at"].(string))
 
 		pullRequestObj := item["pull_request"].(map[string]interface{})
 
-		creator := &User{Id: uint32(user["id"].(float64)),Username: user["login"].(string)}
+		creator := &User{Id: userID ,Username: user["login"].(string)}
 
 		htmURLURL, err := url.Parse(item["html_url"].(string))
 		if err != nil {
@@ -427,34 +433,10 @@ func (ghm *GHMon)extractMostImportantFirst(pullRequestReviews []*PullRequestRevi
 
 func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper) {
 
-	pullRequestScore := PullRequestScore{}
-
-	importantPullRequestReviews := make([]*PullRequestReview, 0)
-	for _, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByUser {
-		pullRequestReview := ghm.extractMostImportantFirst(pullRequestReviews)
-		importantPullRequestReviews = append(importantPullRequestReviews, pullRequestReview)
-	}
-
-	pullRequestScore.NumReviewers = uint(len(importantPullRequestReviews))
-	pullRequestScore.Seen = pullRequestWrapper.Seen
-	pullRequestScore.AgeSec = uint32(time.Now().Unix() - pullRequestWrapper.FirstSeen.Unix())
-
-	for _, pullRequestReview := range importantPullRequestReviews {
-		switch pullRequestReview.Status {
-		case "APPROVED" : pullRequestScore.Approvals++
-		case "CHANGES_REQUESTED" : pullRequestScore.ChangesRequested++
-		case "COMMENTED" : pullRequestScore.Comments++
-		}
-	}
-
-	pullRequestWrapper.Score = pullRequestScore
+	ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
 
 }
 
-func (ghm *GHMon) MarkSeen(pullRequestWrapper *PullRequestWrapper) {
-	pullRequestWrapper.Seen = true
-	go ghm.store.StorePullRequestWrapper(pullRequestWrapper)
-}
 
 func (ghm *GHMon) calculateScore(pullRequestScore PullRequestScore) int {
 
@@ -476,13 +458,15 @@ func (ghm *GHMon) calculateScore(pullRequestScore PullRequestScore) int {
 func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullRequestWrapper {
 
 	for _, pullRequestWrapper := range ghm.pullRequestWrappers {
-		if pullRequestWrapper.Id == pullRequestId {
-			return pullRequestWrapper
+		pullRequestWrapperInstance := pullRequestWrapper
+		if pullRequestWrapperInstance.Id == pullRequestId {
+			return pullRequestWrapperInstance
 		}
 	}
 	for _, pullRequestWrapper := range ghm.myPullRequestsWrappers {
-		if pullRequestWrapper.Id == pullRequestId {
-			return pullRequestWrapper
+		pullRequestWrapperInstance := pullRequestWrapper
+		if pullRequestWrapperInstance.Id == pullRequestId {
+			return pullRequestWrapperInstance
 		}
 	}
 
@@ -632,6 +616,12 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 		for _, requestedReviewerItem := range requestedReviewers {
 			requestedReviewer := requestedReviewerItem.(map[string]interface{})
 			id := uint32(requestedReviewer["id"].(float64))
+
+			if pullRequestWrapper.Id == id {
+				ghm.logger.Printf("Filtering out review comments on own pull request for %d", pullRequestWrapper.Id)
+				continue
+			}
+
 			user := &User{uint32(requestedReviewer["id"].(float64)), requestedReviewer["login"].(string)}
 
 			pullRequest.Lock.Lock()
@@ -655,6 +645,11 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 
 			id := uint32(user["id"].(float64))
 
+			if pullRequestWrapper.Id == id {
+				ghm.logger.Printf("Filtering out review comments on own pull request for %d", pullRequestWrapper.Id)
+				continue
+			}
+
 			state := requestedReviewer["state"].(string)
 			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: state}
 			if timeString, ok := requestedReviewer["submitted_at"].(string); ok {
@@ -666,6 +661,7 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 				ghm.logger.Printf("No existing items for %d, will add new list", id)
 				pullRequest.PullRequestReviewsByUser[id] = make([]*PullRequestReview, 0)
 			}
+			
 			ghm.logger.Printf("Adding review: %s/%s", pullRequestReview.User.Username, pullRequestReview.Status)
 			pullRequest.PullRequestReviewsByUser[id] = append(pullRequest.PullRequestReviewsByUser[id], &pullRequestReview)
 			pullRequest.Lock.Unlock()

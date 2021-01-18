@@ -203,7 +203,7 @@ func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
 			currentlySelectedPullRequest := ghui.getCurrentlySelectedPullRequest()
 			if currentlySelectedPullRequest != nil && currentlySelectedPullRequest.Id == pullRequestWrapper.Id {
 				ghui.ghMon.Logger().Printf("Marking %d as seen", pullRequestWrapper.Id)
-				ghui.ghMon.MarkSeen(pullRequestWrapper)
+				currentlySelectedPullRequest.Seen = true
 
 				ghui.app.QueueUpdateDraw(func() {
 					ghui.handlePullRequestsUpdates(ghui.getPullRequestGroup(pullRequestWrapper).pullRequestWrappers)
@@ -473,13 +473,6 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 	}
 
 	pullRequestGroup := ghui.getPullRequestGroup(loadedPullRequestWrappers[0])
-
-	longestRepoName := 0
-	for _,pullRequestWrapper := range loadedPullRequestWrappers {
-		if len(pullRequestWrapper.PullRequest.Repo.Name) > longestRepoName {
-			longestRepoName = len(pullRequestWrapper.PullRequest.Repo.Name)
-		}
-	}
 
 	pullRequestTable := pullRequestGroup.pullRequestTable
 	currentlySelectedPullRequest := pullRequestGroup.currentlySelectedPullRequestWrapper
