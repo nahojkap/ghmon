@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 )
 
 type GHMonStorage struct {
+	logger *log.Logger
 	cachedPullRequestFolder string
 }
 

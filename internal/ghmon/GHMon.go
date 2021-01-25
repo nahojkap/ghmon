@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/kelseyhightower/envconfig"
+	"github.com/kirsle/configdir"
 	"io/ioutil"
 	"log"
 	"net/url"
@@ -13,14 +14,13 @@ import (
 	"sort"
 	"sync"
 	"time"
-	"github.com/kirsle/configdir"
 )
 
 type Configuration struct {
 	OwnQuery string `split_words:"true"`
 	ReviewQuery string `split_words:"true"`
 	RefreshInterval time.Duration `default:"15m" split_words:"true"`
-	SynchronousRequests bool `default:"false" split_words:"true"`
+	SynchronousRequests bool `default:"true" split_words:"true"`
 }
 
 type GHMon struct {
@@ -31,9 +31,10 @@ type GHMon struct {
 	pullRequestWrappers     map[uint32]*PullRequestWrapper
 	myPullRequestsWrappers  map[uint32]*PullRequestWrapper
 	events                  chan Event
-	configuration           Configuration
+	configuration           *Configuration
 	store                   *GHMonStorage
 	logger                  *log.Logger
+	scoreCalculator			*ScoreCalculator
 }
 
 type User struct {
@@ -50,7 +51,7 @@ const (
 
 type PullRequestReview struct {
 	User *User
-	Status string
+	Status PullRequestReviewStatus
 	SubmittedAt time.Time
 }
 
@@ -97,6 +98,15 @@ type PullRequestWrapper struct {
 	PullRequest *PullRequest
 }
 
+type PullRequestReviewStatus int
+const (
+	PullRequestReviewStatusUnknown PullRequestReviewStatus = iota
+	PullRequestReviewStatusApproved
+	PullRequestReviewStatusCommented
+	PullRequestReviewStatusChangesRequested
+	PullRequestReviewStatusPending
+	PullRequestReviewStatusRequested
+)
 
 type EventType int
 
@@ -159,10 +169,15 @@ func NewGHMon() *GHMon {
 		events : make(chan Event,5),
 		store: &GHMonStorage{
 			cachedPullRequestFolder: cachedPullRequestFolder,
+			logger: logger,
 		},
 		cachedPullRequestFolder: cachedPullRequestFolder,
 		configPath: configPath,
 		logger : logger,
+		scoreCalculator: &ScoreCalculator{
+			logger: logger,
+		},
+		configuration: &configuration,
 	}
 
 	return &ghm
@@ -373,11 +388,11 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			}
 		}
 
-		lock.Lock()
+		//lock.Lock()
 		currentPullRequestWrapper := ghm.getCurrentPullRequestWrapper(pullRequest.Id)
 		pullRequestWrapper := ghm.mergePullRequestWrappers(&pullRequest, currentPullRequestWrapper)
 		pullRequestsWrappers[pullRequestId] = pullRequestWrapper
-		lock.Unlock()
+		//lock.Unlock()
 
 		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequestsWrappers[pullRequestId].Id)}
 
@@ -393,66 +408,8 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 }
 
-
-func  (ghm *GHMon) pullRequestReviewStatusToInt(pullRequestReview *PullRequestReview) int {
-	switch pullRequestReview.Status {
-	case "APPROVED":
-		return 12
-	case "COMMENTED":
-		return 15
-	case "CHANGES_REQUESTED":
-		return 10
-	case "PENDING":
-		return 17
-	case "REQUESTED":
-		return 20
-	default:
-		return 50
-	}
-}
-
-
-func (ghm *GHMon)extractMostImportantFirst(pullRequestReviews []*PullRequestReview) *PullRequestReview {
-
-	// FIXME: The reviews need to be sorted by date as well - e.g. its possible to have an approval *after* a comment
-	// FIXME: and then another comment, which officially requires a re-review
-	// FIXME: Or should it be that the presence of any approval should be signalled differently and only be
-	// FIXME: cancelled if there is a request for change?
-
-	sort.Slice(pullRequestReviews, func (i, j int) bool {
-		if (pullRequestReviews[i].Status == "APPROVED" || pullRequestReviews[i].Status == "CHANGES_REQUESTED") && (pullRequestReviews[j].Status == "APPROVED" || pullRequestReviews[j].Status == "CHANGES_REQUESTED") {
-			return pullRequestReviews[i].SubmittedAt.After(pullRequestReviews[j].SubmittedAt)
-		}
-		return ghm.pullRequestReviewStatusToInt(pullRequestReviews[i]) < ghm.pullRequestReviewStatusToInt(pullRequestReviews[j])
-	})
-
-	return pullRequestReviews[0]
-
-}
-
-
 func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper) {
-
 	ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
-
-}
-
-
-func (ghm *GHMon) calculateScore(pullRequestScore PullRequestScore) int {
-
-	if pullRequestScore.ChangesRequested > 0 {
-		return -1
-	}
-
-	if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
-		return 100
-	}
-
-	if pullRequestScore.Comments > 0 {
-		return 50
-	}
-
-	return 150
 }
 
 func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullRequestWrapper {
@@ -500,8 +457,8 @@ func (ghm *GHMon) sortPullRequestWrappers(pullRequestWrappers map[uint32]*PullRe
 		left := sortedPullRequestWrappers[i]
 		right := sortedPullRequestWrappers[j]
 
-		leftScore := ghm.calculateScore(left.Score)
-		rightScore := ghm.calculateScore(right.Score)
+		leftScore := ghm.scoreCalculator.CalculateTotalScore(left.Score)
+		rightScore := ghm.scoreCalculator.CalculateTotalScore(right.Score)
 
 		if leftScore == rightScore {
 			return left.PullRequest.Id < right.PullRequest.Id
@@ -628,7 +585,7 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 			if _, ok := pullRequest.PullRequestReviewsByUser[id]; !ok {
 				pullRequest.PullRequestReviewsByUser[id] = make([]*PullRequestReview,0)
 			}
-			pullRequestReview := &PullRequestReview{User: user,Status: "REQUESTED"}
+			pullRequestReview := &PullRequestReview{User: user,Status: PullRequestReviewStatusRequested}
 			ghm.logger.Printf("Adding review request: %s/%s", pullRequestReview.User.Username, pullRequestReview.Status)
 			pullRequest.PullRequestReviewsByUser[id] = append(pullRequest.PullRequestReviewsByUser[id],pullRequestReview)
 			pullRequest.Lock.Unlock()
@@ -650,8 +607,8 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 				continue
 			}
 
-			state := requestedReviewer["state"].(string)
-			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: state}
+			stateStr := requestedReviewer["state"].(string)
+			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: ghm.ConvertToPullRequestReviewState(stateStr)}
 			if timeString, ok := requestedReviewer["submitted_at"].(string); ok {
 				pullRequestReview.SubmittedAt, _ = time.Parse(time.RFC3339, timeString)
 			}
@@ -689,6 +646,42 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
 }
 
+func (ghm *GHMon) ConvertToPullRequestReviewState(pullRequestReviewStatusString string) PullRequestReviewStatus {
+	switch pullRequestReviewStatusString {
+	case "APPROVED":
+		return PullRequestReviewStatusApproved
+	case "COMMENTED":
+		return PullRequestReviewStatusCommented
+	case "CHANGES_REQUESTED":
+		return PullRequestReviewStatusChangesRequested
+	case "PENDING":
+		return PullRequestReviewStatusPending
+	case "REQUESTED":
+		return PullRequestReviewStatusRequested
+	default:
+		return PullRequestReviewStatusUnknown
+	}
+}
+
+
+func (ghm *GHMon) ConvertPullRequestReviewStateToString(pullRequestReviewStatus PullRequestReviewStatus) string {
+	switch pullRequestReviewStatus {
+	case PullRequestReviewStatusApproved:
+		return "Approved"
+	case PullRequestReviewStatusCommented:
+		return "Commented"
+	case PullRequestReviewStatusChangesRequested:
+		return "Changes Requested"
+	case PullRequestReviewStatusPending:
+		return "Pending"
+	case PullRequestReviewStatusRequested:
+		return "Requested"
+	default:
+		return "Unknown Status"
+	}
+}
+
+
 func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
 	keys := make([]uint32,0)
@@ -697,16 +690,17 @@ func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrappe
 	}
 
 	sort.Slice(keys, func(i, j int) bool {
-		left := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[i]])
-		right := ghm.extractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[j]])
 
-		leftToInt := ghm.pullRequestReviewStatusToInt(left)
-		rightToInt := ghm.pullRequestReviewStatusToInt(right)
+		left := ghm.scoreCalculator.ExtractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[i]])
+		right := ghm.scoreCalculator.ExtractMostImportantFirst(pullRequestWrapper.PullRequest.PullRequestReviewsByUser[keys[j]])
 
-		if leftToInt == rightToInt {
+		rank := ghm.scoreCalculator.RankPullRequestReview(left,right)
+
+		if rank == 0 {
 			return left.User.Id < right.User.Id
 		}
-		return leftToInt < rightToInt
+
+		return rank < 0
 	})
 
 	sortedPullRequestReviews := make([][]*PullRequestReview, 0)
