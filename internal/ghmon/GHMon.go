@@ -29,12 +29,12 @@ type GHMon struct {
 	cachedRepoInformation   map[*url.URL]*Repo
 	user                    *User
 	pullRequestWrappers     map[uint32]*PullRequestWrapper
-	myPullRequestsWrappers  map[uint32]*PullRequestWrapper
 	events                  chan Event
 	configuration           *Configuration
 	store                   *GHMonStorage
 	logger                  *log.Logger
 	scoreCalculator			*ScoreCalculator
+	internalEvents			chan Event
 }
 
 type User struct {
@@ -96,6 +96,7 @@ type PullRequestWrapper struct {
 	Seen bool
 	Score PullRequestScore
 	PullRequest *PullRequest
+	deleted bool
 }
 
 type PullRequestReviewStatus int
@@ -106,14 +107,17 @@ const (
 	PullRequestReviewStatusChangesRequested
 	PullRequestReviewStatusPending
 	PullRequestReviewStatusRequested
+	PullRequestReviewStatusDismissed
 )
 
 type EventType int
 
 const (
 	Status EventType = iota
+	PullRequestRefreshStarted
 	PullRequestsUpdates
 	PullRequestUpdated
+	PullRequestRefreshFinished
 )
 
 type PullRequestsUpdatesEvent struct {
@@ -178,9 +182,54 @@ func NewGHMon() *GHMon {
 			logger: logger,
 		},
 		configuration: &configuration,
+		internalEvents: make(chan Event, 5),
+		pullRequestWrappers: make(map[uint32]*PullRequestWrapper,0),
 	}
 
+	go ghm.processInternalEvents()
+
 	return &ghm
+}
+
+func (ghm *GHMon) processInternalEvents()  {
+
+	var previousPullRequestWrappers map[uint32]*PullRequestWrapper = nil
+	for {
+		event := <- ghm.internalEvents
+		switch event.eventType {
+		case PullRequestRefreshStarted:
+			ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
+			previousPullRequestWrappers = make(map[uint32]*PullRequestWrapper, len(ghm.pullRequestWrappers))
+			for k,v := range ghm.pullRequestWrappers {
+				key := k
+				value := v
+				previousPullRequestWrappers[key] = value
+			}
+		case PullRequestRefreshFinished:
+
+			for k,_ := range previousPullRequestWrappers {
+				key := k
+				ghm.pullRequestWrappers[key].deleted = true
+				ghm.events <- Event{eventType: PullRequestUpdated, payload: ghm.pullRequestWrappers[key]}
+			}
+
+			ghm.events <- Event{eventType: Status, payload: "idle"}
+		case PullRequestUpdated:
+
+			pullRequestWrapper := event.payload.(*PullRequestWrapper)
+			if _, ok := ghm.pullRequestWrappers[pullRequestWrapper.Id]; !ok {
+				ghm.pullRequestWrappers[pullRequestWrapper.Id] = pullRequestWrapper
+				sortedPullRequestWrappers := ghm.sortPullRequestWrappers(ghm.pullRequestWrappers)
+				ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers}}
+			}
+			ghm.events <- event
+
+		case PullRequestsUpdates:
+			ghm.events <- event
+		}
+	}
+
+
 }
 
 func (ghm *GHMon) Events() <-chan Event {
@@ -189,13 +238,8 @@ func (ghm *GHMon) Events() <-chan Event {
 
 func (ghm *GHMon) monitorGithub() {
 	for {
-		if ghm.configuration.SynchronousRequests {
-			ghm.RetrievePullRequests()
-			ghm.RetrieveMyPullRequests()
-		} else {
-			go ghm.RetrievePullRequests()
-			go ghm.RetrieveMyPullRequests()
-		}
+		// FIXME: Should take into consideration start of this method vs when it finished
+		ghm.RetrievePullRequests()
 		time.Sleep(15 * time.Minute)
 	}
 }
@@ -334,7 +378,7 @@ func (ghm *GHMon) getRepo(repoURL *url.URL) *Repo {
 }
 
 
-func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, pullRequestsWrappers map[uint32]*PullRequestWrapper, result map[string]interface{}, lock *sync.Mutex) {
+func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, result map[string]interface{}) {
 
 	pullRequestItems := result["items"].([]interface{})
 	count := len(pullRequestItems)
@@ -345,6 +389,8 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 
 		item := pullRequestItem.(map[string]interface{})
 		pullRequestId := uint32(item["id"].(float64))
+
+		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequestId)}
 
 		user := item["user"].(map[string]interface{})
 		userID := uint32(user["id"].(float64))
@@ -388,21 +434,12 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, p
 			}
 		}
 
-		//lock.Lock()
 		currentPullRequestWrapper := ghm.getCurrentPullRequestWrapper(pullRequest.Id)
 		pullRequestWrapper := ghm.mergePullRequestWrappers(&pullRequest, currentPullRequestWrapper)
-		pullRequestsWrappers[pullRequestId] = pullRequestWrapper
-		//lock.Unlock()
 
-		ghm.events <- Event{eventType: Status, payload: fmt.Sprintf("processing pull request %d", pullRequestsWrappers[pullRequestId].Id)}
+		ghm.addPullRequestReviewers(pullRequestWrapper)
 
-		if ghm.configuration.SynchronousRequests {
-			ghm.addPullRequestReviewers(pullRequestsWrappers[pullRequestId])
-		} else {
-			go ghm.addPullRequestReviewers(pullRequestsWrappers[pullRequestId])
-		}
-
-
+		ghm.internalEvents <- Event{eventType: PullRequestUpdated,payload: pullRequestWrapper}
 
 	}
 
@@ -420,13 +457,6 @@ func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullReques
 			return pullRequestWrapperInstance
 		}
 	}
-	for _, pullRequestWrapper := range ghm.myPullRequestsWrappers {
-		pullRequestWrapperInstance := pullRequestWrapper
-		if pullRequestWrapperInstance.Id == pullRequestId {
-			return pullRequestWrapperInstance
-		}
-	}
-
 	channel := ghm.store.LoadPullRequestWrapper(pullRequestId)
 
 	return <-channel
@@ -472,74 +502,72 @@ func (ghm *GHMon) sortPullRequestWrappers(pullRequestWrappers map[uint32]*PullRe
 
 }
 
-
 func (ghm *GHMon) RetrievePullRequests() {
 
-	ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
-	pullRequestWrappers := make(map[uint32]*PullRequestWrapper, 0)
+	ghm.internalEvents <- Event{eventType: PullRequestRefreshStarted}
 
-	var lock sync.Mutex
-	if ghm.configuration.ReviewQuery != "" {
-		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
-		ghm.parsePullRequestQueryResult(Reviewer,pullRequestWrappers,result, &lock)
-	} else {
-
-		var waitGroup sync.WaitGroup
-		waitGroup.Add(2)
-
-		retrieveRequestedPullRequests := func() {
+	retrieveMyPullRequests := func() {
+		if ghm.configuration.OwnQuery != "" {
 			// Need the set of PR that has been 'seen' by the user as well as those requested
-			result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer,pullRequestWrappers,result, &lock)
-			waitGroup.Done()
-		}
-
-		retrieveReviewedByPullRequests := func() {
-			result := makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
-			ghm.parsePullRequestQueryResult(Reviewer, pullRequestWrappers, result, &lock)
-			waitGroup.Done()
-		}
-
-		if ghm.configuration.SynchronousRequests {
-			retrieveRequestedPullRequests()
-			retrieveReviewedByPullRequests()
+			result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
+			ghm.parsePullRequestQueryResult(Own, result)
 		} else {
-			go retrieveRequestedPullRequests()
-			go retrieveReviewedByPullRequests()
+			// Need the set of PR that has been 'seen' by the user as well as those requested
+			result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
+			ghm.parsePullRequestQueryResult(Own, result)
 		}
-
-		waitGroup.Wait()
-
 	}
 
-	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
+	retrievePullRequests := func() {
+		if ghm.configuration.ReviewQuery != "" {
+			// Need the set of PR that has been 'seen' by the user as well as those requested
+			result := makeAPIRequest("/search/issues?q=" + ghm.configuration.ReviewQuery)
+			ghm.parsePullRequestQueryResult(Reviewer,result)
+		} else {
+
+			var waitGroup sync.WaitGroup
+			waitGroup.Add(2)
+
+			retrieveRequestedPullRequests := func() {
+				// Need the set of PR that has been 'seen' by the user as well as those requested
+				result := makeAPIRequest("/search/issues?q=is:open+is:pr+review-requested:@me+archived:false")
+				ghm.parsePullRequestQueryResult(Reviewer,result)
+				waitGroup.Done()
+			}
+
+			retrieveReviewedByPullRequests := func() {
+				result := makeAPIRequest("/search/issues?q=is:open+is:pr+reviewed-by:@me+archived:false")
+				ghm.parsePullRequestQueryResult(Reviewer, result)
+				waitGroup.Done()
+			}
+
+			go retrieveRequestedPullRequests()
+			go retrieveReviewedByPullRequests()
+
+			waitGroup.Wait()
+
+		}
+	}
+
+	go retrieveMyPullRequests()
+	go retrievePullRequests()
+
+/*	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
 
 	changesMade := len(pullRequestWrappers) != len(ghm.pullRequestWrappers)
 	ghm.pullRequestWrappers = pullRequestWrappers
 	if changesMade {
 		ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers}}
 	}
-
-	ghm.events <- Event{eventType: Status, payload: "idle"}
+*/
+	// ghm.events <- Event{eventType: Status, payload: "idle"}
 }
 
-
+/*
 func (ghm *GHMon) RetrieveMyPullRequests() {
 
-	var lock sync.Mutex
 	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
 	pullRequestWrappers := make(map[uint32]*PullRequestWrapper, 0)
-
-	if ghm.configuration.OwnQuery != "" {
-		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := makeAPIRequest("/search/issues?q=" + ghm.configuration.OwnQuery)
-		ghm.parsePullRequestQueryResult(Own, pullRequestWrappers,result, &lock)
-	} else {
-		// Need the set of PR that has been 'seen' by the user as well as those requested
-		result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
-		ghm.parsePullRequestQueryResult(Own,pullRequestWrappers,result, &lock)
-	}
 
 	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
 
@@ -553,7 +581,7 @@ func (ghm *GHMon) RetrieveMyPullRequests() {
 	ghm.events <- Event{eventType: Status, payload: "idle"}
 
 }
-
+*/
 
 func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
@@ -627,15 +655,8 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 		waitGroup.Done()
 	}
 
-	if ghm.configuration.SynchronousRequests {
-		retrieveRequestedReviewers()
-		retrieveReviews()
-	} else {
-		go retrieveRequestedReviewers()
-		go retrieveReviews()
-	}
-
-	// FIXME: Should also retrieve comments directly on the ticket here ...
+	go retrieveRequestedReviewers()
+	go retrieveReviews()
 
 	waitGroup.Wait()
 
@@ -658,7 +679,10 @@ func (ghm *GHMon) ConvertToPullRequestReviewState(pullRequestReviewStatusString 
 		return PullRequestReviewStatusPending
 	case "REQUESTED":
 		return PullRequestReviewStatusRequested
+	case "DISMISSED":
+		return PullRequestReviewStatusDismissed
 	default:
+		ghm.logger.Print("Unknown pull request review state: %s", pullRequestReviewStatusString)
 		return PullRequestReviewStatusUnknown
 	}
 }
@@ -713,4 +737,9 @@ func (ghm *GHMon) sortPullRequestReviewers(pullRequestWrapper *PullRequestWrappe
 
 func (ghm *GHMon) Logger() *log.Logger {
 	return ghm.logger
+}
+
+func (ghm *GHMon) UpdateSeen(pullRequestWrapper *PullRequestWrapper, seen bool) {
+	pullRequestWrapper.Seen = seen
+	ghm.store.StorePullRequestWrapper(pullRequestWrapper)
 }
