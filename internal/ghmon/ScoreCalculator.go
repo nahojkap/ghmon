@@ -26,6 +26,8 @@ func  (scoreCalculator *ScoreCalculator) pullRequestReviewStatusToInt(pullReques
 		return 17
 	case PullRequestReviewStatusRequested:
 		return 20
+	case PullRequestReviewStatusDismissed:
+		return 10
 	default:
 		return 50
 	}
@@ -49,7 +51,7 @@ func (scoreCalculator *ScoreCalculator) ExtractMostImportantFirst(pullRequestRev
 
 }
 
-func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestScore PullRequestScore) int {
+func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestScore PullRequestScore) float32 {
 
 	if pullRequestScore.ChangesRequested > 0 {
 		return -1

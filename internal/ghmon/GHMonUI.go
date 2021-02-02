@@ -55,17 +55,25 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	status.SetTextAlign(tview.AlignLeft)
 	status.SetText("")
 
-	yourPullRequestLabel := tview.NewTextView()
-	yourPullRequestLabel.SetTextAlign(tview.AlignLeft)
-	yourPullRequestLabel.SetText("Your Pull Request(s)")
-
 	reviewPullRequestLabel := tview.NewTextView()
 	reviewPullRequestLabel.SetTextAlign(tview.AlignLeft)
-	reviewPullRequestLabel.SetText("Pending Pull Request(s)")
+	reviewPullRequestLabel.SetText(" Pending Pull Request(s)")
+
+	pullRequestDetailsLabel := tview.NewTextView()
+	pullRequestDetailsLabel.SetTextAlign(tview.AlignLeft)
+	pullRequestDetailsLabel.SetText(" Pull Request Details")
+
+	descriptionLabel := tview.NewTextView()
+	descriptionLabel.SetTextAlign(tview.AlignLeft)
+	descriptionLabel.SetText(" Description")
+
+	reviewersLabel := tview.NewTextView()
+	reviewersLabel.SetTextAlign(tview.AlignLeft)
+	reviewersLabel.SetText(" Reviewers")
 
 	grid := tview.NewGrid().
-		SetRows(1,4,10, 1, 0, 1).
-		SetColumns(-2,-1).
+		SetRows(1, -2, 1, 8, 1, -3, 1).
+		SetColumns(-2,-3).
 		SetBorders(true)
 
 	grid.SetBackgroundColor(tcell.Color16)
@@ -73,14 +81,18 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	// FIXME: Layout for screens narrower than 100 cells
 
 	// Layout for screens wider than 100 cells.
-	grid.AddItem(reviewPullRequestLabel, 0, 0, 1, 1, 0, 100, false)
-	grid.AddItem(reviewPullRequestTable, 1, 0, 4, 1, 0, 100, false)
+	grid.AddItem(reviewPullRequestLabel, 0, 0, 1, 2, 0, 0, false)
+	grid.AddItem(reviewPullRequestTable, 1, 0, 1, 2, 0, 0, false)
 
-	grid.AddItem(pullRequestDetails, 0, 1, 2, 1, 0, 100, false)
-	grid.AddItem(reviewerTable, 2, 1, 1, 1, 0, 100, false)
-	grid.AddItem(pullRequestBody, 3, 1, 2	, 1, 0, 100, false)
+	grid.AddItem(pullRequestDetailsLabel, 2, 0, 1, 1, 0, 0, false)
+	grid.AddItem(pullRequestDetails, 3, 0, 1, 1, 0, 0, false)
+	grid.AddItem(reviewersLabel, 4, 0, 1, 1, 0, 0, false)
+	grid.AddItem(reviewerTable, 5, 0, 1, 1, 0, 0, false)
 
-	grid.AddItem(status, 5, 0, 1, 2, 0, 0, false)
+	grid.AddItem(descriptionLabel, 2, 1, 1, 1, 0, 0, false)
+	grid.AddItem(pullRequestBody, 3, 1, 3, 1, 0, 0, false)
+
+	grid.AddItem(status, 6, 0, 1, 2, 0, 0, false)
 	app := tview.NewApplication()
 
 	ghui := UI{
@@ -328,23 +340,26 @@ func (ghui *UI)UpdatePullRequestDetails(pullRequestGroup *PullRequestGroup) {
 
 	pullRequestWrapper := pullRequestWrappers[uint32(pullRequestGroup.currentlySelectedPullRequestWrapperIndex)]
 
-	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]Title:"))
-	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",ghui.escapeSquareBracketsInString(pullRequestWrapper.PullRequest.Title))))
-	ghui.pullRequestDetails.SetCell(1,0,tview.NewTableCell(" [::b]Creator: "))
-	ghui.pullRequestDetails.SetCell(1,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a]%s",pullRequestWrapper.PullRequest.Creator.Username)))
-	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Created: "))
-	ghui.pullRequestDetails.SetCell(2,1,tview.NewTableCell(pullRequestWrapper.PullRequest.CreatedAt.String()))
-	ghui.pullRequestDetails.SetCell(3,0,tview.NewTableCell(" [::b]Updated: "))
-	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(pullRequestWrapper.PullRequest.UpdatedAt.String()))
-	ghui.pullRequestDetails.SetCell(4,0,tview.NewTableCell(" [::b]First Seen: "))
-	ghui.pullRequestDetails.SetCell(4,1,tview.NewTableCell(pullRequestWrapper.FirstSeen.String()))
-
+	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]ID:"))
+	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%d",pullRequestWrapper.PullRequest.Id)))
+	ghui.pullRequestDetails.SetCell(1,0,tview.NewTableCell(" [::b]Title:"))
+	ghui.pullRequestDetails.SetCell(1,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",ghui.escapeSquareBracketsInString(pullRequestWrapper.PullRequest.Title))))
+	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Creator: "))
+	ghui.pullRequestDetails.SetCell(2,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a]%s",pullRequestWrapper.PullRequest.Creator.Username)))
+	ghui.pullRequestDetails.SetCell(3,0,tview.NewTableCell(" [::b]Created: "))
+	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(pullRequestWrapper.PullRequest.CreatedAt.String()))
+	ghui.pullRequestDetails.SetCell(4,0,tview.NewTableCell(" [::b]Updated: "))
+	ghui.pullRequestDetails.SetCell(4,1,tview.NewTableCell(pullRequestWrapper.PullRequest.UpdatedAt.String()))
+	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]First Seen: "))
+	ghui.pullRequestDetails.SetCell(5,1,tview.NewTableCell(pullRequestWrapper.FirstSeen.String()))
+	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]Score: "))
+	ghui.pullRequestDetails.SetCell(5,1,tview.NewTableCell(fmt.Sprintf("[::b]%f",pullRequestWrapper.Score.Total)))
 	ghui.pullRequestBody.SetText(fmt.Sprintf("%s", pullRequestWrapper.PullRequest.Body))
 
 	ghui.reviewerTable.Clear()
 
 	for i, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByPriority {
-		status := fmt.Sprintf(" [%s][%s[]", ghui.getPullRequestReviewColorString(pullRequestReviews[0]),ghui.ghMon.ConvertPullRequestReviewStateToString(pullRequestReviews[0].Status))
+		status := fmt.Sprintf("[%s][%s[]", ghui.getPullRequestReviewColorString(pullRequestReviews[0]),ghui.ghMon.ConvertPullRequestReviewStateToString(pullRequestReviews[0].Status))
 		ghui.reviewerTable.SetCell(i, 1, tview.NewTableCell(status))
 		ghui.reviewerTable.SetCell(i, 2, tview.NewTableCell(pullRequestReviews[0].User.Username))
 	}
@@ -438,7 +453,7 @@ func (ghui *UI)handlePullRequestsUpdates(pullRequestType PullRequestType, loaded
 		expandedSeen := padToLen(seen, 3)
 		expandedUser := padToLen(pullRequestItem.Creator.Username, 20)
 
-		expandedHeatPattern := "[red]▒[green]▓░[#d6f5d6]░░"
+		expandedHeatPattern := ghui.getHeatPattern(pullRequestWrapper)
 
 		pullRequestTable.SetCell(counter,0, tview.NewTableCell(expandedSeen))
 		pullRequestTable.SetCell(counter,1, tview.NewTableCell(expandedHeatPattern))
@@ -530,7 +545,7 @@ func (ghui *UI) EventLoop() {
 
 	go ghui.pollEvents()
 
-	if err := ghui.app.SetRoot(ghui.grid, true).EnableMouse(true).Run(); err != nil {
+	if err := ghui.app.SetRoot(ghui.grid, true).EnableMouse(false).Run(); err != nil {
 		panic(err)
 	}
 
@@ -601,4 +616,14 @@ func (ghui *UI) EventLoop() {
 	//	go ghui.renderAll()
 	//}
 
+}
+
+func (ghui *UI) getHeatPattern(wrapper *PullRequestWrapper) string {
+	if wrapper.Score.Total < 25 {
+		return "[red]▒▒▒▒▒▒"
+	}
+	if wrapper.Score.Total < 50	 {
+		return "[orange]▒▒▒▒▒▒"
+	}
+	return "[green]▒▒▒▒▒▒"
 }

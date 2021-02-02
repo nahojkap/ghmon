@@ -85,6 +85,7 @@ type PullRequestScore struct {
 	AgeSec uint32
 	Approvals uint
 	Comments uint
+	Dismissed uint
 	ChangesRequested uint
 	NumReviewers uint
 }
@@ -446,7 +447,9 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, r
 }
 
 func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper) {
-	ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
+	score := ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
+	score.Total = ghm.scoreCalculator.CalculateTotalScore(score)
+	pullRequestWrapper.Score = score
 }
 
 func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullRequestWrapper {
