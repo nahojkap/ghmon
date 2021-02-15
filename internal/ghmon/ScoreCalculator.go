@@ -2,6 +2,7 @@ package ghmon
 
 import (
 	"log"
+	"math"
 	"sort"
 	"time"
 )
@@ -14,8 +15,8 @@ type LoggerConsole struct {
 	logger *log.Logger
 }
 
-func  (scoreCalculator *ScoreCalculator) pullRequestReviewStatusToInt(pullRequestReview *PullRequestReview) int {
-	switch pullRequestReview.Status {
+func  (scoreCalculator *ScoreCalculator) PullRequestReviewStatusToInt(status PullRequestReviewStatus) int {
+	switch status {
 	case PullRequestReviewStatusApproved:
 		return 12
 	case PullRequestReviewStatusCommented:
@@ -27,7 +28,8 @@ func  (scoreCalculator *ScoreCalculator) pullRequestReviewStatusToInt(pullReques
 	case PullRequestReviewStatusRequested:
 		return 20
 	case PullRequestReviewStatusDismissed:
-		return 10
+		// Dismissed is a little vague - is it approved -> changes to code -> dismissed approval?
+		return 13
 	default:
 		return 50
 	}
@@ -44,28 +46,63 @@ func (scoreCalculator *ScoreCalculator) ExtractMostImportantFirst(pullRequestRev
 		if (pullRequestReviews[i].Status == PullRequestReviewStatusApproved || pullRequestReviews[i].Status == PullRequestReviewStatusChangesRequested) && (pullRequestReviews[j].Status == PullRequestReviewStatusApproved || pullRequestReviews[j].Status == PullRequestReviewStatusChangesRequested) {
 			return pullRequestReviews[i].SubmittedAt.After(pullRequestReviews[j].SubmittedAt)
 		}
-		return scoreCalculator.pullRequestReviewStatusToInt(pullRequestReviews[i]) < scoreCalculator.pullRequestReviewStatusToInt(pullRequestReviews[j])
+		return scoreCalculator.PullRequestReviewStatusToInt(pullRequestReviews[i].Status) < scoreCalculator.PullRequestReviewStatusToInt(pullRequestReviews[j].Status)
 	})
 
 	return pullRequestReviews[0]
 
 }
 
-func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestScore PullRequestScore) float32 {
+func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestWrapper *PullRequestWrapper) float32 {
 
-	if pullRequestScore.ChangesRequested > 0 {
-		return -1
+	if pullRequestWrapper.Deleted {
+		return -10
 	}
 
+	pullRequestScore := pullRequestWrapper.Score
+
+	if pullRequestScore.Dismissed > 0 {
+		return -10
+	}
+
+	//
+	// * Is prioritized project
+	// * Is prioritized creator?
+	// * Has X minutes passed since 'seen'?
+	// * Was it seen and never 'opened'?
+	// * Has it been all approved already?
+	//   * If 'own', then has it been a a while since it was approvided?
+
+	// Has the PR been all approved?
 	if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
-		return 100
+		return 0
+	}
+
+	var totalScore float32 = 0
+
+	if pullRequestScore.ChangesRequested > 0 {
+		totalScore += 75
+	}
+
+	if pullRequestScore.Approvals > 0 {
+		totalScore -= float32(pullRequestScore.Approvals * 10)
 	}
 
 	if pullRequestScore.Comments > 0 {
-		return 50
+		totalScore += float32(pullRequestScore.Comments * 10)
 	}
 
-	return 150
+	if pullRequestScore.AgeSec > (60*60*48) {
+		totalScore += 50
+	} else if pullRequestScore.AgeSec > (60*60*24) {
+		totalScore += 30
+	} else if pullRequestScore.AgeSec > (60*60*6) {
+		totalScore += 20
+	} else if pullRequestScore.AgeSec > (60*60) {
+		totalScore += 10
+	}
+
+	return float32(math.Min(float64(100), float64(totalScore)))
 }
 
 
@@ -91,11 +128,13 @@ func (scoreCalculator *ScoreCalculator) CalculateScore(pullRequestWrapper *PullR
 		}
 	}
 
+	pullRequestScore.Total = scoreCalculator.CalculateTotalScore(pullRequestWrapper)
+
 	return pullRequestScore
 }
 
 func (scoreCalculator *ScoreCalculator) RankPullRequestReview(left *PullRequestReview, right *PullRequestReview) int {
-	leftScore := scoreCalculator.pullRequestReviewStatusToInt(left)
-	rightScore := scoreCalculator.pullRequestReviewStatusToInt(right)
+	leftScore := scoreCalculator.PullRequestReviewStatusToInt(left.Status)
+	rightScore := scoreCalculator.PullRequestReviewStatusToInt(right.Status)
 	return leftScore - rightScore
 }

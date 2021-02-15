@@ -3,21 +3,27 @@
 	import (
 		"fmt"
 		"github.com/gdamore/tcell/v2"
-		tview "github.com/rivo/tview"
+		tview "gitlab.com/tslocum/cview"
 		"log"
 		"os/exec"
 		"runtime"
 		"strings"
 		"sync"
 		"time"
+		"github.com/andanhm/go-prettytime"
 	)
 
+
+type PullRequestEntry struct {
+	tableIndex int
+	pullRequestWrapper *PullRequestWrapper
+}
+
 type PullRequestGroup struct {
-	pullRequestType     PullRequestType
 	pullRequestTable    *tview.Table
-	pullRequestWrappers []*PullRequestWrapper
-	currentlySelectedPullRequestWrapper *PullRequestWrapper
-	currentlySelectedPullRequestWrapperIndex int
+	pullRequestEntries []*PullRequestEntry
+	currentlySelectedPullRequestEntry *PullRequestEntry
+	currentlySelectedPullRequestEntryIndex int
 }
 
 type UI struct {
@@ -45,7 +51,11 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	tview.Styles.ContrastBackgroundColor = tcell.Color16
 	tview.Styles.PrimitiveBackgroundColor = tcell.Color16
 
-	reviewPullRequestTable := tview.NewTable().SetBorders(false).SetSeparator('|')
+	reviewPullRequestTable := tview.NewTable()
+	reviewPullRequestTable.SetBorders(false)
+	reviewPullRequestTable.SetSeparator('|')
+	reviewPullRequestTable.SetBackgroundColor(tcell.Color16)
+	reviewPullRequestTable.SetEvaluateAllRows(true)
 
 	reviewerTable := tview.NewTable()
 	pullRequestDetails := tview.NewTable()
@@ -71,12 +81,12 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	reviewersLabel.SetTextAlign(tview.AlignLeft)
 	reviewersLabel.SetText(" Reviewers")
 
-	grid := tview.NewGrid().
-		SetRows(1, -2, 1, 8, 1, -3, 1).
-		SetColumns(-2,-3).
-		SetBorders(true)
-
+	grid := tview.NewGrid()
+	grid.SetRows(1, -2, 1, 8, 1, -3, 1)
+	grid.SetColumns(-2,-3)
+	grid.SetBorders(true)
 	grid.SetBackgroundColor(tcell.Color16)
+	grid.SetBackgroundTransparent(false)
 
 	// FIXME: Layout for screens narrower than 100 cells
 
@@ -95,84 +105,76 @@ func NewGHMonUI(ghm *GHMon) *UI {
 	grid.AddItem(status, 6, 0, 1, 2, 0, 0, false)
 	app := tview.NewApplication()
 
-	ghui := UI{
+	ghui := UI {
 		ghMon: ghm,app: app, grid: grid, reviewerTable: reviewerTable,
 		status: status, pullRequestDetails: pullRequestDetails,
 		pullRequestBody:  pullRequestBody,
 		timerCanceled: make(chan bool,1),
+		reviewPullRequestGroup: &PullRequestGroup{pullRequestTable: reviewPullRequestTable},
 	}
-
-	ghui.reviewPullRequestGroup = &PullRequestGroup{pullRequestType: Reviewer, pullRequestTable: reviewPullRequestTable}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		// We navigate in between focuses here
 		if event.Key() == tcell.KeyRune {
 			switch event.Rune() {
-				case 'Q':
-				case 'q':
+				case 'Q','q' :
 					ghui.app.Stop()
 					return nil
-			case 'R':
-			case 'r':
-				go ghui.RefreshPullRequests()
+			case 'R', 'r' :
+				go ghui.refreshPullRequests()
 				return nil
-				default:
+			case 'p' :
+				go ghui.purgePullRequests()
+				return nil
+			case 'z' :
+				go ghui.snoozePullRequest()
+				return nil
+			default:
 			}
 
 		}
 		return event
 	})
 
-	app.SetMouseCapture(func(event *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
-		return event, action
-	})
-
-	reviewPullRequestTable.Select(0, 0).SetFixed(1, 1).SetDoneFunc(func(key tcell.Key) {
+	reviewPullRequestTable.Select(0, 0)
+	reviewPullRequestTable.SetFixed(0, 0)
+	reviewPullRequestTable.SetDoneFunc(func(key tcell.Key) {
 		// What here?
-	}).SetSelectedFunc(func(row int, column int) {
-		ghui.openBrowser(row)
+	})
+	reviewPullRequestTable.SetSelectedFunc(func(row int, column int) {
+		ghui.openBrowser(ghui.reviewPullRequestGroup.pullRequestEntries[row].pullRequestWrapper)
 	})
 	reviewPullRequestTable.SetSelectable(true,false)
-	reviewPullRequestTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		return event
-	})
+
 	reviewPullRequestTable.SetSelectionChangedFunc(func(row, column int) {
 		ghui.handlePullRequestSelectionChanged(ghui.reviewPullRequestGroup, row)
 	})
-	reviewPullRequestTable.SetMouseCapture(func(action tview.MouseAction,event *tcell.EventMouse) (tview.MouseAction,*tcell.EventMouse) {
-		return action,nil
-	})
+
+	reviewPullRequestTable.SetInputCapture(app.GetInputCapture())
 
 	app.SetFocus(ghui.reviewPullRequestGroup.pullRequestTable)
 
 	go ghui.app.QueueUpdateDraw(func() {
 		app.SetFocus(ghui.reviewPullRequestGroup.pullRequestTable)
-		ghui.handlePullRequestSelectionChanged(ghui.reviewPullRequestGroup, ghui.reviewPullRequestGroup.currentlySelectedPullRequestWrapperIndex)
 	})
 
 
 	return &ghui
 }
 
-func (ghui *UI) getCurrentlySelectedPullRequest() *PullRequestWrapper {
-	return ghui.reviewPullRequestGroup.currentlySelectedPullRequestWrapper
+func (ghui *UI) getCurrentlySelectedPullRequest() *PullRequestEntry {
+	return ghui.reviewPullRequestGroup.currentlySelectedPullRequestEntry
 }
 
 func (ghui *UI) handlePullRequestSelectionChanged(pullRequestGroup *PullRequestGroup, row int) {
 
-	if len(pullRequestGroup.pullRequestWrappers) > 0 && row >= 0 {
+	pullRequestGroup.currentlySelectedPullRequestEntryIndex = row
+	pullRequestGroup.currentlySelectedPullRequestEntry = pullRequestGroup.pullRequestEntries[row]
 
-		ghui.updateSelectedPullRequestWrapper(pullRequestGroup, row)
-
-		go ghui.handlePullRequestSelected(pullRequestGroup.currentlySelectedPullRequestWrapper)
-
-		go ghui.app.QueueUpdateDraw(func() {
-			ghui.UpdatePullRequestDetails(pullRequestGroup)
-		})
-	}
-	// FIXME: else, clear the pull request details
+	go ghui.app.QueueUpdateDraw(func() {
+		ghui.handlePullRequestSelected(pullRequestGroup.pullRequestEntries[row])
+	})
 }
-
 
 func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
 
@@ -182,11 +184,12 @@ func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
 			ghui.ghMon.Logger().Printf("Seen timer timeout for %d", pullRequestWrapper.Id)
 			// if current pull request is still the same one as we started 'seeing'
 			currentlySelectedPullRequest := ghui.getCurrentlySelectedPullRequest()
-			if currentlySelectedPullRequest != nil && currentlySelectedPullRequest.Id == pullRequestWrapper.Id {
+
+			if currentlySelectedPullRequest != nil && currentlySelectedPullRequest.pullRequestWrapper.Id == pullRequestWrapper.Id {
 				ghui.ghMon.Logger().Printf("Marking %d as seen", pullRequestWrapper.Id)
 				ghui.ghMon.UpdateSeen(pullRequestWrapper, true)
 				ghui.app.QueueUpdateDraw(func() {
-					ghui.handlePullRequestsUpdates(pullRequestWrapper.PullRequestType, ghui.getPullRequestGroup(pullRequestWrapper).pullRequestWrappers)
+					ghui.handlePullRequestUpdated(pullRequestWrapper)
 				})
 			}
 		case <-ghui.timerCanceled:
@@ -195,10 +198,13 @@ func (ghui *UI) startSeenTimer(pullRequestWrapper *PullRequestWrapper) {
 
 }
 
-func (ghui *UI) handlePullRequestSelected(pullRequestWrapper *PullRequestWrapper) {
+func (ghui *UI) handlePullRequestSelected(pullRequestEntry *PullRequestEntry) {
 
+	pullRequestWrapper := pullRequestEntry.pullRequestWrapper
 	ghui.ghMon.Logger().Printf("Selected pull request %d", pullRequestWrapper.Id)
 	ghui.ghMon.Logger().Printf("Pull Request Seen? %t", pullRequestWrapper.Seen)
+
+	ghui.updatePullRequestDetails(pullRequestWrapper)
 
 	// FIXME: Slightly weird since we essentially throw away the channel each time
 	ghui.timerCanceled <- true
@@ -213,15 +219,15 @@ func (ghui *UI) handlePullRequestSelected(pullRequestWrapper *PullRequestWrapper
 
 }
 
-func (ghui *UI) updateSelectedPullRequestWrapper(pullRequestGroup *PullRequestGroup, index int) {
-	if len(pullRequestGroup.pullRequestWrappers) > 0 && index >= 0 {
-		pullRequestGroup.currentlySelectedPullRequestWrapperIndex = index
-		pullRequestGroup.currentlySelectedPullRequestWrapper = pullRequestGroup.pullRequestWrappers[index]
-	}
+func (ghui *UI) refreshPullRequests() {
+	go ghui.ghMon.RetrievePullRequests()
 }
 
-func (ghui *UI) RefreshPullRequests() {
-	go ghui.ghMon.RetrievePullRequests()
+func (ghui *UI) snoozePullRequest() {
+}
+
+func (ghui *UI) purgePullRequests() {
+	ghui.ghMon.PurgeDeletedPullRequests()
 }
 
 func (ghui *UI) getPullRequestReviewColorString(pullRequestReview *PullRequestReview) (color string) {
@@ -330,46 +336,9 @@ func (ghui *UI)escapeSquareBracketsInString(str string) string {
 	return b.String()
 }
 
-func (ghui *UI)UpdatePullRequestDetails(pullRequestGroup *PullRequestGroup) {
+func (ghui *UI) openBrowser(pullRequestWrapper *PullRequestWrapper) {
 
-	pullRequestWrappers := pullRequestGroup.pullRequestWrappers
-
-	if len(pullRequestWrappers) == 0 {
-		return
-	}
-
-	pullRequestWrapper := pullRequestWrappers[uint32(pullRequestGroup.currentlySelectedPullRequestWrapperIndex)]
-
-	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]ID:"))
-	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%d",pullRequestWrapper.PullRequest.Id)))
-	ghui.pullRequestDetails.SetCell(1,0,tview.NewTableCell(" [::b]Title:"))
-	ghui.pullRequestDetails.SetCell(1,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",ghui.escapeSquareBracketsInString(pullRequestWrapper.PullRequest.Title))))
-	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Creator: "))
-	ghui.pullRequestDetails.SetCell(2,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a]%s",pullRequestWrapper.PullRequest.Creator.Username)))
-	ghui.pullRequestDetails.SetCell(3,0,tview.NewTableCell(" [::b]Created: "))
-	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(pullRequestWrapper.PullRequest.CreatedAt.String()))
-	ghui.pullRequestDetails.SetCell(4,0,tview.NewTableCell(" [::b]Updated: "))
-	ghui.pullRequestDetails.SetCell(4,1,tview.NewTableCell(pullRequestWrapper.PullRequest.UpdatedAt.String()))
-	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]First Seen: "))
-	ghui.pullRequestDetails.SetCell(5,1,tview.NewTableCell(pullRequestWrapper.FirstSeen.String()))
-	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]Score: "))
-	ghui.pullRequestDetails.SetCell(5,1,tview.NewTableCell(fmt.Sprintf("[::b]%f",pullRequestWrapper.Score.Total)))
-	ghui.pullRequestBody.SetText(fmt.Sprintf("%s", pullRequestWrapper.PullRequest.Body))
-
-	ghui.reviewerTable.Clear()
-
-	for i, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByPriority {
-		status := fmt.Sprintf("[%s][%s[]", ghui.getPullRequestReviewColorString(pullRequestReviews[0]),ghui.ghMon.ConvertPullRequestReviewStateToString(pullRequestReviews[0].Status))
-		ghui.reviewerTable.SetCell(i, 1, tview.NewTableCell(status))
-		ghui.reviewerTable.SetCell(i, 2, tview.NewTableCell(pullRequestReviews[0].User.Username))
-	}
-}
-
-
-func (ghui *UI) openBrowser(selectedPullRequest int) {
-
-	pullRequest := ghui.reviewPullRequestGroup.pullRequestWrappers[uint32(selectedPullRequest)]
-	url := pullRequest.PullRequest.HtmlURL.String()
+	url := pullRequestWrapper.PullRequest.HtmlURL.String()
 
 	var err error
 
@@ -390,12 +359,16 @@ func (ghui *UI) openBrowser(selectedPullRequest int) {
 
 }
 
-func (ghui *UI) getPullRequestGroup(pullRequestWrapper *PullRequestWrapper) *PullRequestGroup {
-	return ghui.reviewPullRequestGroup
-}
+func pruneTo(str string, requiredLen int) string {
+	if len(str) >= requiredLen {
 
-func (ghui *UI) getPullRequestGroupFromType(pullRequestType PullRequestType) *PullRequestGroup {
-	return ghui.reviewPullRequestGroup
+		if len(str) > 3 {
+			trimmedString := string(str[0 : requiredLen-3])
+			trimmedString += "..."
+			return trimmedString
+		}
+	}
+	return str
 }
 
 func padToLen(str string, requiredLen int) string {
@@ -408,7 +381,7 @@ func padToLen(str string, requiredLen int) string {
 	return paddedString
 }
 
-func (ghui *UI) HasPullReviewStatus(pullRequstReviewStatus PullRequestReviewStatus, pullRequestWrapper *PullRequestWrapper) bool {
+func (ghui *UI) hasPullReviewStatus(pullRequstReviewStatus PullRequestReviewStatus, pullRequestWrapper *PullRequestWrapper) bool {
 	for _, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByUser {
 		for _, pullRequestReview := range pullRequestReviews {
 			if pullRequestReview.Status == pullRequstReviewStatus {
@@ -420,85 +393,167 @@ func (ghui *UI) HasPullReviewStatus(pullRequstReviewStatus PullRequestReviewStat
 	return false
 }
 
-func (ghui *UI)handlePullRequestsUpdates(pullRequestType PullRequestType, loadedPullRequestWrappers []*PullRequestWrapper) {
+func (ghui *UI) getHeatPattern(wrapper *PullRequestWrapper) (int, string) {
+
+	if wrapper.Deleted {
+		return 0,""
+	}
+
+	if wrapper.Score.Total > 75 {
+		return 5,"[red]▒▒▒▒▒▒"
+	}
+	if wrapper.Score.Total > 50	 {
+		return 8,"[orange]▒▒▒▒▒▒"
+	}
+	return 8, "[green]▒▒▒▒▒▒"
+}
+
+func (ghui *UI) updatePullRequestDetails(pullRequestWrapper *PullRequestWrapper) {
+
+	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]ID:"))
+	ghui.pullRequestDetails.SetCell(0,1,tview.NewTableCell(fmt.Sprintf("[::b]%d",pullRequestWrapper.PullRequest.Id)))
+	ghui.pullRequestDetails.SetCell(1,0,tview.NewTableCell(" [::b]Title:"))
+	ghui.pullRequestDetails.SetCell(1,1,tview.NewTableCell(fmt.Sprintf("[::b]%s",ghui.escapeSquareBracketsInString(pullRequestWrapper.PullRequest.Title))))
+	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Creator: "))
+	ghui.pullRequestDetails.SetCell(2,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a::]%s",pullRequestWrapper.PullRequest.Creator.Username)))
+	ghui.pullRequestDetails.SetCell(3,0,tview.NewTableCell(" [::b]Created: "))
+	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(pullRequestWrapper.PullRequest.CreatedAt.String()))
+	ghui.pullRequestDetails.SetCell(4,0,tview.NewTableCell(" [::b]Updated: "))
+	ghui.pullRequestDetails.SetCell(4,1,tview.NewTableCell(prettytime.Format(pullRequestWrapper.PullRequest.UpdatedAt)))
+	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]First Seen: "))
+	ghui.pullRequestDetails.SetCell(5,1,tview.NewTableCell(pullRequestWrapper.FirstSeen.String()))
+	ghui.pullRequestDetails.SetCell(6,0,tview.NewTableCell(" [::b]Score: "))
+	ghui.pullRequestDetails.SetCell(6,1,tview.NewTableCell(fmt.Sprintf("[::b]%f",pullRequestWrapper.Score.Total)))
+	ghui.pullRequestDetails.SetCell(7,0,tview.NewTableCell(" [::b]Deleted: "))
+	ghui.pullRequestDetails.SetCell(7,1,tview.NewTableCell(fmt.Sprintf("[::b]%t",pullRequestWrapper.Deleted)))
+	ghui.pullRequestBody.SetText(fmt.Sprintf("%s", pullRequestWrapper.PullRequest.Body))
+
+	ghui.reviewerTable.Clear()
+	for i, pullRequestReviews := range pullRequestWrapper.PullRequest.PullRequestReviewsByPriority {
+		status := fmt.Sprintf("[%s][%s[]", ghui.getPullRequestReviewColorString(pullRequestReviews[0]),ghui.ghMon.ConvertPullRequestReviewStateToString(pullRequestReviews[0].Status))
+		ghui.reviewerTable.SetCell(i, 1, tview.NewTableCell(status))
+		ghui.reviewerTable.SetCell(i, 2, tview.NewTableCell(pullRequestReviews[0].User.Username))
+		ghui.reviewerTable.SetCell(i, 3, tview.NewTableCell(fmt.Sprintf("[%f[]", pullRequestReviews[0].Score)))
+
+	}
+}
+
+func (ghui *UI) updatePullRequestEntry(pullRequestEntry *PullRequestEntry) {
+
+	pullRequestGroup := ghui.reviewPullRequestGroup
+	pullRequestTable := pullRequestGroup.pullRequestTable
+
+	pullRequestWrapper := pullRequestEntry.pullRequestWrapper
+	pullRequestItem := pullRequestWrapper.PullRequest
+
+	seen := " "
+	if !pullRequestWrapper.Seen {
+		seen = "*"
+	}
+
+	_,_, width, _ := pullRequestTable.GetRect()
+
+	// We can expand the title and repo fields to ensure consistent display
+	// AvailableSpace := width - border (2) + dividers (3 * 6) + Seen (1) + heat pattern (5) + brief status (9) + Date (30) + Repo Name (35) + User (20)
+	availableSpace := width - (2 + 3*6 + 1 + 5 + 9 + 30 + 35 + 20)
+
+	expandedRepoName := padToLen(pruneTo(pullRequestItem.Repo.Name, 33), 35)
+	title := ghui.escapeSquareBracketsInString(pullRequestItem.Title)
+
+	stylingLength := 0
+	if pullRequestWrapper.Deleted {
+		title = "[::s]" + title + "[::-]"
+		stylingLength = 10
+	}
+	expandedTitle := padToLen(title, availableSpace-stylingLength)
+
+
+	expandedDate := padToLen(pullRequestItem.UpdatedAt.String(), 30)
+	expandedAttributes := padToLen(ghui.getPullRequestReviewStatusString(pullRequestWrapper), 9)
+	expandedSeen := padToLen(seen, 3)
+	expandedUser := padToLen(pullRequestItem.Creator.Username, 20)
+
+	coloringLength, heatPattern := ghui.getHeatPattern(pullRequestWrapper)
+	expandedHeatPattern := padToLen(heatPattern,9-coloringLength)
+
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,0, tview.NewTableCell(expandedSeen))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,1, tview.NewTableCell(expandedHeatPattern))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,2, tview.NewTableCell(expandedAttributes))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,3,tview.NewTableCell(expandedTitle))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,4, tview.NewTableCell(expandedRepoName))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,5, tview.NewTableCell(expandedUser))
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,6, tview.NewTableCell(expandedDate))
+
+}
+
+func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullRequestWrapper) {
 
 	if len(loadedPullRequestWrappers) <= 0 {
 		return
 	}
 
-	pullRequestGroup := ghui.getPullRequestGroupFromType(pullRequestType)
+	selectedIndex := 0
+	var currentlySelectedEntry *PullRequestEntry = nil
 
-	pullRequestTable := pullRequestGroup.pullRequestTable
+	if len(ghui.reviewPullRequestGroup.pullRequestEntries) > 0 {
+		selectedIndex,_ = ghui.reviewPullRequestGroup.pullRequestTable.GetSelection()
+		currentlySelectedEntry = ghui.reviewPullRequestGroup.pullRequestEntries[selectedIndex]
+	}
+
+	pullRequestGroup := ghui.reviewPullRequestGroup
 	pullRequestGroup.pullRequestTable.Clear()
+	pullRequestGroup.pullRequestEntries = make([]*PullRequestEntry, 0)
 
 	for counter, pullRequestWrapper := range loadedPullRequestWrappers {
 
-		pullRequestItem := pullRequestWrapper.PullRequest
-
-		seen := " "
-		if !pullRequestWrapper.Seen {
-			seen = "*"
+		if currentlySelectedEntry != nil && pullRequestWrapper.Id == currentlySelectedEntry.pullRequestWrapper.Id {
+			selectedIndex = counter
 		}
 
-		_,_, width, _ := pullRequestTable.GetRect()
-
-		// We can expand the title and repo fields to ensure consistent display
-		// AvailableSpace := width - border (2) + dividers (3 * 6) + Seen (1) + heat pattern (5) + brief status (8) + Date (30) + Repo Name (30) + User (20)
-		availableSpace := width - (2 + 3*6 + 1 + 5 + 8 + 30 + 35 + 20)
-
-		expandedRepoName := padToLen(pullRequestItem.Repo.Name, 35	)
-		expandedTitle := padToLen(ghui.escapeSquareBracketsInString(pullRequestItem.Title), availableSpace)
-		expandedDate := padToLen(pullRequestItem.UpdatedAt.String(), 30)
-		expandedAttributes := padToLen(ghui.getPullRequestReviewStatusString(pullRequestWrapper), 7)
-		expandedSeen := padToLen(seen, 3)
-		expandedUser := padToLen(pullRequestItem.Creator.Username, 20)
-
-		expandedHeatPattern := ghui.getHeatPattern(pullRequestWrapper)
-
-		pullRequestTable.SetCell(counter,0, tview.NewTableCell(expandedSeen))
-		pullRequestTable.SetCell(counter,1, tview.NewTableCell(expandedHeatPattern))
-		pullRequestTable.SetCell(counter,2, tview.NewTableCell(expandedAttributes))
-		pullRequestTable.SetCell(counter,3,tview.NewTableCell(expandedTitle))
-		pullRequestTable.SetCell(counter,4, tview.NewTableCell(expandedRepoName))
-		pullRequestTable.SetCell(counter,5, tview.NewTableCell(expandedUser))
-		pullRequestTable.SetCell(counter,6, tview.NewTableCell(expandedDate))
-
-		counter++
+		pullRequestEntry := &PullRequestEntry{pullRequestWrapper: pullRequestWrapper,tableIndex: counter}
+		ghui.updatePullRequestEntry(pullRequestEntry)
+		pullRequestGroup.pullRequestEntries = append(pullRequestGroup.pullRequestEntries, pullRequestEntry)
 	}
 
-	pullRequestGroup.pullRequestWrappers = loadedPullRequestWrappers
+	for selectedIndex >= pullRequestGroup.pullRequestTable.GetRowCount() {
+		selectedIndex--
+	}
 
-	go ghui.app.QueueUpdateDraw(func() {
-		ghui.handlePullRequestSelectionChanged(pullRequestGroup, pullRequestGroup.currentlySelectedPullRequestWrapperIndex)
-	})
+	pullRequestGroup.pullRequestTable.Select(selectedIndex,0)
 
 }
 
 func (ghui *UI)getPullRequestReviewStatusString(pullRequestWrapper *PullRequestWrapper) string {
 
-	statusString := []byte{'-','-','-','-','-','-','-'}
+	statusString := []byte{'-','-','-','-','-','-','-', '-'}
 
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusPending, pullRequestWrapper) {
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusPending, pullRequestWrapper) {
 		statusString[0] = 'P'
 	}
 
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusRequested, pullRequestWrapper) {
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusRequested, pullRequestWrapper) {
 		statusString[1] = 'R'
 	}
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusCommented, pullRequestWrapper) {
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusCommented, pullRequestWrapper) {
 		statusString[2] = 'C'
 	}
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusApproved, pullRequestWrapper) {
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusApproved, pullRequestWrapper) {
 		statusString[3] = 'A'
 	}
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusChangesRequested, pullRequestWrapper) {
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusChangesRequested, pullRequestWrapper) {
 		statusString[4] = 'B'
 	}
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusDismissed, pullRequestWrapper) {
+
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusDismissed, pullRequestWrapper) {
 		statusString[5] = 'D'
 	}
-	if ghui.HasPullReviewStatus(PullRequestReviewStatusUnknown, pullRequestWrapper) {
+
+	if ghui.hasPullReviewStatus(PullRequestReviewStatusUnknown, pullRequestWrapper) {
 		statusString[6] = 'U'
+	}
+
+	if pullRequestWrapper.Deleted {
+		statusString[7] = 'X'
 	}
 
 	return string(statusString)
@@ -506,16 +561,65 @@ func (ghui *UI)getPullRequestReviewStatusString(pullRequestWrapper *PullRequestW
 
 }
 
-func (ghui *UI) handlePullRequestUpdated(loadedPullRequest *PullRequestWrapper) {
+func (ghui *UI) handlePullRequestDeleted(pullRequestWrapper *PullRequestWrapper) {
 
-	currentlySelectedPullRequestWrapper := ghui.reviewPullRequestGroup.currentlySelectedPullRequestWrapper
-	if currentlySelectedPullRequestWrapper != nil && currentlySelectedPullRequestWrapper.Id == loadedPullRequest.Id {
-		ghui.UpdatePullRequestDetails(ghui.reviewPullRequestGroup)
+	// Should simply update the pull request entry at this point - the list will be updated later
+
+	var pullRequestEntry *PullRequestEntry = nil
+	var pullRequestEntryIndex int = -1
+	for index, existingPullRequestEntry := range ghui.reviewPullRequestGroup.pullRequestEntries {
+		if existingPullRequestEntry.pullRequestWrapper.Id == pullRequestWrapper.Id {
+			pullRequestEntry = existingPullRequestEntry
+			pullRequestEntry.pullRequestWrapper = pullRequestWrapper
+			pullRequestEntryIndex = index
+		}
 	}
+
+	if pullRequestEntry != nil {
+		ghui.updatePullRequestEntry(pullRequestEntry)
+
+		selectedRow,_ := ghui.reviewPullRequestGroup.pullRequestTable.GetSelection()
+		if  selectedRow == pullRequestEntryIndex {
+			ghui.updatePullRequestDetails(pullRequestWrapper)
+		}
+	}
+
+
+}
+
+func (ghui *UI) handlePullRequestUpdated(pullRequestWrapper *PullRequestWrapper) {
+
+	// First find the item in the current list of pull request entries
+
+	var pullRequestEntry *PullRequestEntry = nil
+	var pullRequestEntryIndex int = -1
+	for index, existingPullRequestEntry := range ghui.reviewPullRequestGroup.pullRequestEntries {
+		if existingPullRequestEntry.pullRequestWrapper.Id == pullRequestWrapper.Id {
+			pullRequestEntry = existingPullRequestEntry
+			pullRequestEntry.pullRequestWrapper = pullRequestWrapper
+			pullRequestEntryIndex = index
+		}
+	}
+
+	// If not in the list, safe to ignore
+	// If in the list, update the list entry
+	// If in the list && the index == currently selected index, update the details view too
+
+	if pullRequestEntry != nil {
+		ghui.updatePullRequestEntry(pullRequestEntry)
+
+		selectedRow,_ := ghui.reviewPullRequestGroup.pullRequestTable.GetSelection()
+		if  selectedRow == pullRequestEntryIndex {
+			ghui.updatePullRequestDetails(pullRequestWrapper)
+		}
+	}
+
 }
 
 func (ghui *UI) handleStatusUpdate(status string) {
-	ghui.status.SetText(" " + status)
+	go ghui.app.QueueUpdateDraw(func() {
+		ghui.status.SetText(" " + status)
+	})
 }
 
 func (ghui *UI) pollEvents() {
@@ -523,16 +627,19 @@ func (ghui *UI) pollEvents() {
 	for {
 		event := <-events
 		switch event.eventType {
+		case PullRequestDeleted:
+			go ghui.app.QueueUpdateDraw(func(){
+				ghui.handlePullRequestDeleted(event.payload.(*PullRequestWrapper))
+			})
 		case PullRequestUpdated:
 			go ghui.app.QueueUpdateDraw(func() {
 				ghui.handlePullRequestUpdated(event.payload.(*PullRequestWrapper))
-				ghui.handlePullRequestsUpdates(Reviewer,ghui.getPullRequestGroup(event.payload.(*PullRequestWrapper)).pullRequestWrappers)
 			})
-		case PullRequestsUpdates:
+		case PullRequestRefreshFinished,PullRequestsUpdates:
 
 			go ghui.app.QueueUpdateDraw(func() {
 				pullRequestsUpdatesEvent := event.payload.(PullRequestsUpdatesEvent)
-				ghui.handlePullRequestsUpdates(pullRequestsUpdatesEvent.pullRequestType, pullRequestsUpdatesEvent.pullRequestWrappers)
+				ghui.handlePullRequestsUpdates(pullRequestsUpdatesEvent.pullRequestWrappers)
 			})
 
 		case Status:
@@ -545,85 +652,12 @@ func (ghui *UI) EventLoop() {
 
 	go ghui.pollEvents()
 
-	if err := ghui.app.SetRoot(ghui.grid, true).EnableMouse(false).Run(); err != nil {
+	ghui.app.SetRoot(ghui.grid, true)
+	ghui.app.SetFocus(ghui.reviewerTable)
+	ghui.app.EnableMouse(false)
+
+	if err := ghui.app.Run(); err != nil {
 		panic(err)
 	}
 
-	//err := ui.Init()
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//defer ui.Close()
-	//
-	//termWidth, termHeight := ui.TerminalDimensions()
-	//
-	//ghui.Resize(termHeight, termWidth)
-	//go ghui.renderAll()
-	//
-	//go ghui.pollEvents()
-	//
-	//previousKey := ""
-	//uiEvents := ui.PollEvents()
-	//for {
-	//	e := <-uiEvents
-	//	currentlySelectedPullRequestGroup := ghui.pullRequestGroups[ghui.currentFocusedPullRequestGroup % len(ghui.pullRequestGroups)]
-	//	switch e.ID {
-	//	case "<Tab>":
-	//		ghui.NewFocus()
-	//	case "r":
-	//		ghui.RefreshPullRequests()
-	//	case "q", "<C-c>":
-	//		return
-	//	case "j", "<Down>":
-	//		if len(currentlySelectedPullRequestGroup.pullRequestWrappers) > 0 {
-	//			if currentlySelectedPullRequestGroup.pullRequestList.SelectedRow != (len(currentlySelectedPullRequestGroup.pullRequestList.Rows)-1) {
-	//				currentlySelectedPullRequestGroup.pullRequestList.ScrollDown()
-	//				ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequestWrappers, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
-	//			}
-	//		}
-	//	case "k", "<Up>":
-	//		if len(currentlySelectedPullRequestGroup.pullRequestWrappers) > 0 {
-	//			if currentlySelectedPullRequestGroup.pullRequestList.SelectedRow != 0 {
-	//				currentlySelectedPullRequestGroup.pullRequestList.ScrollUp()
-	//				ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequestWrappers, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
-	//			}
-	//		}
-	//	case "g":
-	//		if previousKey == "g" {
-	//			currentlySelectedPullRequestGroup.pullRequestList.ScrollTop()
-	//			ghui.UpdatePullRequestDetails(currentlySelectedPullRequestGroup.pullRequestWrappers, currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
-	//		}
-	//	case "<Home>":
-	//		currentlySelectedPullRequestGroup.pullRequestList.ScrollTop()
-	//	case "G", "<End>":
-	//		currentlySelectedPullRequestGroup.pullRequestList.ScrollBottom()
-	//	case "<Enter>" :
-	//		ghui.openBrowser(currentlySelectedPullRequestGroup.pullRequestList.SelectedRow)
-	//	case "<Resize>":
-	//		payload := e.Payload.(ui.Resize)
-	//		ghui.Resize(payload.Height, payload.Width)
-	//		ui.Clear()
-	//	}
-	//
-	//	if previousKey == "g" {
-	//		previousKey = ""
-	//	} else {
-	//		previousKey = e.ID
-	//	}
-	//
-	//	// We always render!
-	//	go ghui.renderAll()
-	//}
-
-}
-
-func (ghui *UI) getHeatPattern(wrapper *PullRequestWrapper) string {
-	if wrapper.Score.Total < 25 {
-		return "[red]▒▒▒▒▒▒"
-	}
-	if wrapper.Score.Total < 50	 {
-		return "[orange]▒▒▒▒▒▒"
-	}
-	return "[green]▒▒▒▒▒▒"
 }
