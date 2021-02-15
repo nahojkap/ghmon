@@ -16,7 +16,9 @@ While it is still work in progress, it aims to provide a quick overview of pendi
 
 # Installing/Running
 
-Installing/running _ghmon_ is 
+### Binaries
+
+Installing/running _ghmon_ as a binary involves 
 
 ```shell
 bash$ go get github.com/nahojkap/ghmon
@@ -25,16 +27,25 @@ bash$ ghmon
 
 Ensure that you have _${GOPATH}/bin_ added to your path
 
+### Sources
+
+Installing/running _ghmon_ is
+
+```shell
+bash$ git clone github.com/nahojkap/ghmon
+bash$ cd ghmon
+bash$ go run .
+```
+
 # Keyboard Navigation
 
 Key | Description
 ----|----
-Up/Down Arrows | Navigates the __active__ list
-Home/End | Goes to start/end of __active_ list respectively
-TAB | Switched between "My Pull Requests" and "Active Review Request(s)" lists.
+Up/Down Arrows | Navigate the list of pull requests
 ENTER | Opens the selected pull request in a browser
-r | Refreshes the current list
-q | Exits _ghmon_
+r or R | Refreshes the current list of pull requests
+p or P | Purges any deleted (no longer active on GitHub) pull requests
+q or Q | Exits _ghmon_
 
 # Configuration
 

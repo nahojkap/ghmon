@@ -20,7 +20,6 @@ type Configuration struct {
 	OwnQuery string `split_words:"true"`
 	ReviewQuery string `split_words:"true"`
 	RefreshInterval time.Duration `default:"15m" split_words:"true"`
-	SynchronousRequests bool `default:"true" split_words:"true"`
 }
 
 type GHMon struct {
@@ -29,9 +28,10 @@ type GHMon struct {
 	cachedRepoInformation   map[*url.URL]*Repo
 	user                    *User
 	pullRequestWrappers     map[uint32]*PullRequestWrapper
+	sortedPullRequestWrappers []*PullRequestWrapper
 	events                  chan Event
 	configuration           *Configuration
-	store                   *GHMonStorage
+	store                   *Storage
 	logger                  *log.Logger
 	scoreCalculator			*ScoreCalculator
 	internalEvents			chan Event
@@ -53,6 +53,7 @@ type PullRequestReview struct {
 	User *User
 	Status PullRequestReviewStatus
 	SubmittedAt time.Time
+	Score float32
 }
 
 type Repo struct {
@@ -91,13 +92,14 @@ type PullRequestScore struct {
 }
 
 type PullRequestWrapper struct {
-	Id uint32
+	Id              uint32
 	PullRequestType PullRequestType
-	FirstSeen time.Time
-	Seen bool
-	Score PullRequestScore
-	PullRequest *PullRequest
-	deleted bool
+	FirstSeen       time.Time
+	Seen            bool
+	/* Score is between 0 and 100 (higher score, more critical) */
+	Score           PullRequestScore
+	PullRequest     *PullRequest
+	Deleted         bool
 }
 
 type PullRequestReviewStatus int
@@ -118,6 +120,7 @@ const (
 	PullRequestRefreshStarted
 	PullRequestsUpdates
 	PullRequestUpdated
+	PullRequestDeleted
 	PullRequestRefreshFinished
 )
 
@@ -166,13 +169,12 @@ func NewGHMon() *GHMon {
 	logger := log.New(f, "", log.LstdFlags)
 
 	logger.Printf("Initializing GHMon")
-	logger.Printf("Synchronous Requests: %t", configuration.SynchronousRequests)
 	logger.Printf("Refresh Interval: %s", configuration.RefreshInterval)
 
 	ghm := GHMon{
 		cachedRepoInformation: make(map[*url.URL]*Repo,0),
 		events : make(chan Event,5),
-		store: &GHMonStorage{
+		store: &Storage{
 			cachedPullRequestFolder: cachedPullRequestFolder,
 			logger: logger,
 		},
@@ -194,35 +196,49 @@ func NewGHMon() *GHMon {
 
 func (ghm *GHMon) processInternalEvents()  {
 
-	var previousPullRequestWrappers map[uint32]*PullRequestWrapper = nil
 	for {
 		event := <- ghm.internalEvents
 		switch event.eventType {
 		case PullRequestRefreshStarted:
 			ghm.events <- Event{eventType: Status, payload: "fetching pull requests"}
-			previousPullRequestWrappers = make(map[uint32]*PullRequestWrapper, len(ghm.pullRequestWrappers))
+/*			previousPullRequestWrappers = make(map[uint32]*PullRequestWrapper, len(ghm.pullRequestWrappers))
 			for k,v := range ghm.pullRequestWrappers {
 				key := k
 				value := v
 				previousPullRequestWrappers[key] = value
 			}
-		case PullRequestRefreshFinished:
+*/		case PullRequestRefreshFinished:
 
-			for k,_ := range previousPullRequestWrappers {
-				key := k
-				ghm.pullRequestWrappers[key].deleted = true
-				ghm.events <- Event{eventType: PullRequestUpdated, payload: ghm.pullRequestWrappers[key]}
-			}
+			ghm.sortedPullRequestWrappers = ghm.sortPullRequestWrappers(ghm.pullRequestWrappers)
+			ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: ghm.sortedPullRequestWrappers}}
 
+
+			/*			for k,_ := range previousPullRequestWrappers {
+							key := k
+							ghm.pullRequestWrappers[key].Deleted = true
+							ghm.events <- Event{eventType: PullRequestUpdated, payload: ghm.pullRequestWrappers[key]}
+						}
+
+			*/
 			ghm.events <- Event{eventType: Status, payload: "idle"}
+		case PullRequestDeleted:
+			ghm.events <- event
+
 		case PullRequestUpdated:
 
 			pullRequestWrapper := event.payload.(*PullRequestWrapper)
-			if _, ok := ghm.pullRequestWrappers[pullRequestWrapper.Id]; !ok {
-				ghm.pullRequestWrappers[pullRequestWrapper.Id] = pullRequestWrapper
-				sortedPullRequestWrappers := ghm.sortPullRequestWrappers(ghm.pullRequestWrappers)
-				ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers}}
-			}
+
+			//// If this is a load of a PR from disk, it will not yet exist in the map
+			//// since GitHub active PRs are loaded first.  If not
+			//if existingPullRequestWrapper, ok := ghm.pullRequestWrappers[pullRequestWrapper.Id]; ok {
+			//	if existingPullRequestWrapper != pullRequestWrapper {
+			//		// Loaded from different places
+			//		ghm.pullRequestWrappers[pullRequestWrapper.Id] = ghm.mergePullRequestWrappers(pullRequestWrapper.PullRequest,existingPullRequestWrapper)
+			//	}
+			//}
+			ghm.pullRequestWrappers[pullRequestWrapper.Id] = pullRequestWrapper
+			pullRequestWrapper.Score = ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
+
 			ghm.events <- event
 
 		case PullRequestsUpdates:
@@ -440,6 +456,8 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, r
 
 		ghm.addPullRequestReviewers(pullRequestWrapper)
 
+		pullRequestWrapper.Score = ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
+
 		ghm.internalEvents <- Event{eventType: PullRequestUpdated,payload: pullRequestWrapper}
 
 	}
@@ -447,9 +465,7 @@ func (ghm *GHMon) parsePullRequestQueryResult(pullRequestType PullRequestType, r
 }
 
 func (ghm *GHMon) updatePullRequestScore(pullRequestWrapper *PullRequestWrapper) {
-	score := ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
-	score.Total = ghm.scoreCalculator.CalculateTotalScore(score)
-	pullRequestWrapper.Score = score
+	pullRequestWrapper.Score = ghm.scoreCalculator.CalculateScore(pullRequestWrapper)
 }
 
 func (ghm *GHMon) getCurrentPullRequestWrapper(pullRequestId uint32) *PullRequestWrapper {
@@ -471,10 +487,10 @@ func (ghm *GHMon) mergePullRequestWrappers(pullRequest *PullRequest, currentPull
 	if currentPullRequestWrapper != nil {
 		pullRequestWrapper = currentPullRequestWrapper
 		pullRequestWrapper.PullRequest = pullRequest
+		pullRequestWrapper.Deleted = false
 	} else {
-		pullRequestWrapper = &PullRequestWrapper{Id: pullRequest.Id, PullRequestType: pullRequest.PullRequestType, PullRequest: pullRequest, Score: PullRequestScore{}, Seen: false, FirstSeen: time.Now()}
+		pullRequestWrapper = &PullRequestWrapper{Id: pullRequest.Id, PullRequestType: pullRequest.PullRequestType, PullRequest: pullRequest, Score: PullRequestScore{}, Seen: false, FirstSeen: time.Now(), Deleted: false}
 	}
-	ghm.updatePullRequestScore(pullRequestWrapper)
 	return pullRequestWrapper
 }
 
@@ -490,14 +506,14 @@ func (ghm *GHMon) sortPullRequestWrappers(pullRequestWrappers map[uint32]*PullRe
 		left := sortedPullRequestWrappers[i]
 		right := sortedPullRequestWrappers[j]
 
-		leftScore := ghm.scoreCalculator.CalculateTotalScore(left.Score)
-		rightScore := ghm.scoreCalculator.CalculateTotalScore(right.Score)
+		leftScore := left.Score.Total // ghm.scoreCalculator.CalculateTotalScore(left)
+		rightScore := right.Score.Total // ghm.scoreCalculator.CalculateTotalScore(right)
 
 		if leftScore == rightScore {
 			return left.PullRequest.Id < right.PullRequest.Id
 		}
 
-		return leftScore < rightScore
+		return leftScore > rightScore
 
 	})
 
@@ -506,6 +522,9 @@ func (ghm *GHMon) sortPullRequestWrappers(pullRequestWrappers map[uint32]*PullRe
 }
 
 func (ghm *GHMon) RetrievePullRequests() {
+
+	var retrieveAllPullRequestsWaitGroup sync.WaitGroup
+	retrieveAllPullRequestsWaitGroup.Add(2)
 
 	ghm.internalEvents <- Event{eventType: PullRequestRefreshStarted}
 
@@ -519,6 +538,7 @@ func (ghm *GHMon) RetrievePullRequests() {
 			result := makeAPIRequest("/search/issues?q=is:open+is:pr+author:@me+archived:false")
 			ghm.parsePullRequestQueryResult(Own, result)
 		}
+		retrieveAllPullRequestsWaitGroup.Done()
 	}
 
 	retrievePullRequests := func() {
@@ -548,43 +568,51 @@ func (ghm *GHMon) RetrievePullRequests() {
 			go retrieveReviewedByPullRequests()
 
 			waitGroup.Wait()
-
 		}
+		retrieveAllPullRequestsWaitGroup.Done()
+
 	}
 
 	go retrieveMyPullRequests()
 	go retrievePullRequests()
-
-/*	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
-
-	changesMade := len(pullRequestWrappers) != len(ghm.pullRequestWrappers)
-	ghm.pullRequestWrappers = pullRequestWrappers
-	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers}}
-	}
-*/
-	// ghm.events <- Event{eventType: Status, payload: "idle"}
-}
-
-/*
-func (ghm *GHMon) RetrieveMyPullRequests() {
-
-	ghm.events <- Event{eventType: Status, payload: "fetching my pull requests"}
-	pullRequestWrappers := make(map[uint32]*PullRequestWrapper, 0)
-
-	sortedPullRequestWrappers := ghm.sortPullRequestWrappers(pullRequestWrappers)
-
-	changesMade := len(pullRequestWrappers) != len(ghm.myPullRequestsWrappers)
-	ghm.myPullRequestsWrappers = pullRequestWrappers
-
-	if changesMade {
-		ghm.events <- Event{eventType: PullRequestsUpdates, payload: PullRequestsUpdatesEvent{pullRequestType : Own, pullRequestWrappers: sortedPullRequestWrappers}}
-	}
-
-	ghm.events <- Event{eventType: Status, payload: "idle"}
+	go ghm.waitForRetrievalsToFinish(&retrieveAllPullRequestsWaitGroup)
 
 }
-*/
+
+func (ghm *GHMon) waitForRetrievalsToFinish(waitGroup *sync.WaitGroup) {
+
+	waitGroup.Wait()
+	waitGroup.Add(1)
+
+	// Now, we retrieve all saved pull requests & mark them Deleted if they are not in the list of PRs
+	retrieveSavedPullRequests := func() {
+
+		pullRequestIdentifiers, err := ghm.store.loadStoredPullRequestIdentifiers()
+		if err == nil {
+			ghm.logger.Printf("Loaded %d pull requests from disk", len(pullRequestIdentifiers))
+			for _, pullRequestIdentifier := range pullRequestIdentifiers {
+				channel := ghm.store.LoadPullRequestWrapper(pullRequestIdentifier)
+				pullRequestWrapper := <- channel
+				if pullRequestWrapper != nil {
+					if _, ok := ghm.pullRequestWrappers[pullRequestIdentifier]; !ok {
+						// Ok, the PR does not exist on GitHub, lets use the one loaded from
+						// disk and mark it deleted
+						pullRequestWrapper.Deleted = true
+						ghm.updatePullRequestScore(pullRequestWrapper)
+						ghm.internalEvents <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
+					}
+				}
+			}
+		}
+		waitGroup.Done()
+	}
+
+	go retrieveSavedPullRequests()
+
+	waitGroup.Wait()
+
+	ghm.internalEvents <- Event{eventType: PullRequestRefreshFinished}
+}
 
 func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper) {
 
@@ -639,7 +667,8 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 			}
 
 			stateStr := requestedReviewer["state"].(string)
-			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: ghm.ConvertToPullRequestReviewState(stateStr)}
+			state := ghm.ConvertToPullRequestReviewState(stateStr)
+			pullRequestReview := PullRequestReview{User: &User{id, user["login"].(string)}, Status: state, Score: float32(ghm.scoreCalculator.PullRequestReviewStatusToInt(state))}
 			if timeString, ok := requestedReviewer["submitted_at"].(string); ok {
 				pullRequestReview.SubmittedAt, _ = time.Parse(time.RFC3339, timeString)
 			}
@@ -667,7 +696,7 @@ func (ghm *GHMon) addPullRequestReviewers(pullRequestWrapper *PullRequestWrapper
 	ghm.updatePullRequestScore(pullRequestWrapper)
 	go ghm.store.StorePullRequestWrapper(pullRequestWrapper)
 
-	ghm.events <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
+	ghm.internalEvents <- Event{eventType: PullRequestUpdated, payload: pullRequestWrapper}
 }
 
 func (ghm *GHMon) ConvertToPullRequestReviewState(pullRequestReviewStatusString string) PullRequestReviewStatus {
@@ -703,6 +732,8 @@ func (ghm *GHMon) ConvertPullRequestReviewStateToString(pullRequestReviewStatus 
 		return "Pending"
 	case PullRequestReviewStatusRequested:
 		return "Requested"
+	case PullRequestReviewStatusDismissed:
+		return "Dismissed"
 	default:
 		return "Unknown Status"
 	}
@@ -745,4 +776,23 @@ func (ghm *GHMon) Logger() *log.Logger {
 func (ghm *GHMon) UpdateSeen(pullRequestWrapper *PullRequestWrapper, seen bool) {
 	pullRequestWrapper.Seen = seen
 	ghm.store.StorePullRequestWrapper(pullRequestWrapper)
+}
+
+func (ghm *GHMon) PurgeDeletedPullRequests() int {
+
+	var pullRequestDeleted = 0
+	for _,pullRequestWrapper := range ghm.pullRequestWrappers {
+		if pullRequestWrapper.Deleted {
+			ghm.internalEvents <- Event{eventType: PullRequestDeleted, payload: pullRequestWrapper}
+			// ghm.store.DeletePullRequestWrapper(pullRequestWrapper.Id)
+			delete(ghm.pullRequestWrappers,pullRequestWrapper.Id)
+			pullRequestDeleted++
+		}
+	}
+	if pullRequestDeleted > 0 {
+		sortedPullRequestWrappers := ghm.sortPullRequestWrappers(ghm.pullRequestWrappers)
+		ghm.internalEvents <- Event{eventType: PullRequestsUpdates, payload:PullRequestsUpdatesEvent{pullRequestType: Reviewer, pullRequestWrappers: sortedPullRequestWrappers} }
+	}
+
+	return pullRequestDeleted
 }
