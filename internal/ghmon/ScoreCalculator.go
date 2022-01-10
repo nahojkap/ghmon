@@ -8,6 +8,7 @@ import (
 )
 
 type ScoreCalculator struct {
+	user *User
 	logger *log.Logger
 }
 
@@ -53,10 +54,10 @@ func (scoreCalculator *ScoreCalculator) ExtractMostImportantFirst(pullRequestRev
 
 }
 
-func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestWrapper *PullRequestWrapper) float32 {
+func (scoreCalculator *ScoreCalculator) CalculateTotalScore(user *User, pullRequestWrapper *PullRequestWrapper) float32 {
 
 	if pullRequestWrapper.Deleted {
-		return -10
+		return -999
 	}
 
 	pullRequestScore := pullRequestWrapper.Score
@@ -71,12 +72,13 @@ func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestWrapper *
 	// * Has X minutes passed since 'seen'?
 	// * Was it seen and never 'opened'?
 	// * Has it been all approved already?
-	//   * If 'own', then has it been a a while since it was approvided?
+	//   * If 'own', then has it been a a while since it was approved?
+	//   * is the current user one of the approvers?
 
 	// Has the PR been all approved?
-	if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
-		return 0
-	}
+	//if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
+	//	return 0
+	//}
 
 	var totalScore float32 = 0
 
@@ -92,21 +94,47 @@ func (scoreCalculator *ScoreCalculator) CalculateTotalScore(pullRequestWrapper *
 		totalScore += float32(pullRequestScore.Comments * 10)
 	}
 
-	if pullRequestScore.AgeSec > (60*60*48) {
-		totalScore += 50
-	} else if pullRequestScore.AgeSec > (60*60*24) {
-		totalScore += 30
-	} else if pullRequestScore.AgeSec > (60*60*6) {
-		totalScore += 20
-	} else if pullRequestScore.AgeSec > (60*60) {
-		totalScore += 10
+	if pullRequestScore.Approvals == pullRequestScore.NumReviewers {
+		// Other peoples pull requests that are fully approved are less important
+		if !pullRequestScore.IsMyPullRequest {
+			totalScore -= 100
+		} else {
+			// Own pull requests that are approved but not yet merged get high priority!
+			totalScore += 50
+		}
+	}
+
+	if pullRequestScore.IsMyPullRequest {
+
+		if pullRequestScore.AgeSec > (60 * 60 * 5) {
+			totalScore += 50
+		} else {
+			totalScore += 25
+		}
+
+	} else {
+
+		if pullRequestScore.ApprovedByMe {
+			totalScore -= 200
+		} else {
+			if pullRequestScore.AgeSec > (60*60*48) {
+				totalScore += 50
+			} else if pullRequestScore.AgeSec > (60*60*24) {
+				totalScore += 30
+			} else if pullRequestScore.AgeSec > (60*60*6) {
+				totalScore += 20
+			} else if pullRequestScore.AgeSec > (60*60) {
+				totalScore += 10
+			}
+		}
+
 	}
 
 	return float32(math.Min(float64(100), float64(totalScore)))
 }
 
 
-func (scoreCalculator *ScoreCalculator) CalculateScore(pullRequestWrapper *PullRequestWrapper) PullRequestScore {
+func (scoreCalculator *ScoreCalculator) CalculateScore(user *User, pullRequestWrapper *PullRequestWrapper) PullRequestScore {
 
 	pullRequestScore := PullRequestScore{}
 
@@ -116,19 +144,23 @@ func (scoreCalculator *ScoreCalculator) CalculateScore(pullRequestWrapper *PullR
 		importantPullRequestReviews = append(importantPullRequestReviews, pullRequestReview)
 	}
 
+	pullRequestScore.IsMyPullRequest = pullRequestWrapper.PullRequest.Creator.Id == user.Id
+
 	pullRequestScore.NumReviewers = uint(len(importantPullRequestReviews))
 	pullRequestScore.Seen = pullRequestWrapper.Seen
 	pullRequestScore.AgeSec = uint32(time.Now().Unix() - pullRequestWrapper.FirstSeen.Unix())
 
 	for _, pullRequestReview := range importantPullRequestReviews {
 		switch pullRequestReview.Status {
-		case PullRequestReviewStatusApproved : pullRequestScore.Approvals++
+		case PullRequestReviewStatusApproved :
+			pullRequestScore.Approvals++
+			pullRequestScore.ApprovedByMe = pullRequestReview.User.Id == user.Id
 		case PullRequestReviewStatusChangesRequested: pullRequestScore.ChangesRequested++
 		case PullRequestReviewStatusCommented : pullRequestScore.Comments++
 		}
 	}
 
-	pullRequestScore.Total = scoreCalculator.CalculateTotalScore(pullRequestWrapper)
+	pullRequestScore.Total = scoreCalculator.CalculateTotalScore(user, pullRequestWrapper)
 
 	return pullRequestScore
 }

@@ -5,8 +5,10 @@
 		"github.com/gdamore/tcell/v2"
 		tview "gitlab.com/tslocum/cview"
 		"log"
+		"math"
 		"os/exec"
 		"runtime"
+		"sort"
 		"strings"
 		"sync"
 		"time"
@@ -26,23 +28,36 @@ type PullRequestGroup struct {
 	currentlySelectedPullRequestEntryIndex int
 }
 
+type RepositoryConfiguration struct {
+	color tcell.Color
+	repository *Repo
+}
+
+type UserConfiguration struct {
+	color tcell.Color
+	user *User
+}
+
 type UI struct {
-	ghMon                   *GHMon
+	ghMon  *GHMon
 	uiLock sync.Mutex
 
-	app 					*tview.Application
+	app *tview.Application
 
-	status                  *tview.TextView
+	status *tview.TextView
 
-	pullRequestDetails      *tview.Table
-	pullRequestBody         *tview.TextView
-	reviewerTable           *tview.Table
+	pullRequestDetails *tview.Table
+	pullRequestBody    *tview.TextView
+	reviewerTable      *tview.Table
 
-	grid 					*tview.Grid
-	reviewPullRequestGroup 	*PullRequestGroup
+	grid                   *tview.Grid
+	reviewPullRequestGroup *PullRequestGroup
 
 	timerCanceled chan bool
 
+	userConfigurations       map[uint32]*UserConfiguration
+	repositoryConfigurations map[uint32]*RepositoryConfiguration
+	numRowsForHeader         int
 }
 
 func NewGHMonUI(ghm *GHMon) *UI {
@@ -53,7 +68,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 
 	reviewPullRequestTable := tview.NewTable()
 	reviewPullRequestTable.SetBorders(false)
-	reviewPullRequestTable.SetSeparator('|')
+	// reviewPullRequestTable.SetSeparator('|')
 	reviewPullRequestTable.SetBackgroundColor(tcell.Color16)
 	reviewPullRequestTable.SetEvaluateAllRows(true)
 
@@ -111,6 +126,9 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		pullRequestBody:  pullRequestBody,
 		timerCanceled: make(chan bool,1),
 		reviewPullRequestGroup: &PullRequestGroup{pullRequestTable: reviewPullRequestTable},
+		numRowsForHeader: 1,
+		userConfigurations: make(map[uint32]*UserConfiguration),
+		repositoryConfigurations: make(map[uint32]*RepositoryConfiguration),
 	}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -122,6 +140,9 @@ func NewGHMonUI(ghm *GHMon) *UI {
 					return nil
 			case 'R', 'r' :
 				go ghui.refreshPullRequests()
+				return nil
+			case 'X', 'x' :
+				go ghui.hidePullRequest()
 				return nil
 			case 'p' :
 				go ghui.purgePullRequests()
@@ -142,7 +163,7 @@ func NewGHMonUI(ghm *GHMon) *UI {
 		// What here?
 	})
 	reviewPullRequestTable.SetSelectedFunc(func(row int, column int) {
-		ghui.openBrowser(ghui.reviewPullRequestGroup.pullRequestEntries[row].pullRequestWrapper)
+		ghui.openBrowser(ghui.reviewPullRequestGroup.pullRequestEntries[row-ghui.numRowsForHeader].pullRequestWrapper)
 	})
 	reviewPullRequestTable.SetSelectable(true,false)
 
@@ -168,11 +189,12 @@ func (ghui *UI) getCurrentlySelectedPullRequest() *PullRequestEntry {
 
 func (ghui *UI) handlePullRequestSelectionChanged(pullRequestGroup *PullRequestGroup, row int) {
 
-	pullRequestGroup.currentlySelectedPullRequestEntryIndex = row
-	pullRequestGroup.currentlySelectedPullRequestEntry = pullRequestGroup.pullRequestEntries[row]
+	currentlySelectedPullRequestEntryIndex := row - ghui.numRowsForHeader
+	pullRequestGroup.currentlySelectedPullRequestEntryIndex = currentlySelectedPullRequestEntryIndex
+	pullRequestGroup.currentlySelectedPullRequestEntry = pullRequestGroup.pullRequestEntries[currentlySelectedPullRequestEntryIndex]
 
 	go ghui.app.QueueUpdateDraw(func() {
-		ghui.handlePullRequestSelected(pullRequestGroup.pullRequestEntries[row])
+		ghui.handlePullRequestSelected(pullRequestGroup.pullRequestEntries[currentlySelectedPullRequestEntryIndex])
 	})
 }
 
@@ -221,6 +243,9 @@ func (ghui *UI) handlePullRequestSelected(pullRequestEntry *PullRequestEntry) {
 
 func (ghui *UI) refreshPullRequests() {
 	go ghui.ghMon.RetrievePullRequests()
+}
+
+func (ghui *UI) hidePullRequest() {
 }
 
 func (ghui *UI) snoozePullRequest() {
@@ -408,6 +433,34 @@ func (ghui *UI) getHeatPattern(wrapper *PullRequestWrapper) (int, string) {
 	return 8, "[green]▒▒▒▒▒▒"
 }
 
+func (ghui *UI) formatDate(dateToFormat time.Time, usePrettyTime bool) string {
+
+	// 2021-02-03 11:41:25.843652832 -0500 EST
+
+	now := time.Now()
+
+	if dateToFormat.After(now) {
+
+		// 2021-02-03 11:41:25.843652832 -0500 EST
+		return dateToFormat.String()
+	}
+
+	duration := now.Sub(dateToFormat)
+
+	if duration < time.Hour * 24 && usePrettyTime {
+		// 5 hrs ago
+		return prettytime.Format(dateToFormat)
+	}
+
+	if now.Year() == dateToFormat.Year() {
+		return dateToFormat.Format("Mar 2 2006 15:04:05 MST")
+	}
+
+
+	return dateToFormat.Format("Mar 2 2006 15:04:05 MST")
+
+}
+
 func (ghui *UI) updatePullRequestDetails(pullRequestWrapper *PullRequestWrapper) {
 
 	ghui.pullRequestDetails.SetCell(0,0,tview.NewTableCell(" [::b]ID:"))
@@ -417,7 +470,7 @@ func (ghui *UI) updatePullRequestDetails(pullRequestWrapper *PullRequestWrapper)
 	ghui.pullRequestDetails.SetCell(2,0,tview.NewTableCell(" [::b]Creator: "))
 	ghui.pullRequestDetails.SetCell(2,1,tview.NewTableCell(fmt.Sprintf("[#00ff1a::]%s",pullRequestWrapper.PullRequest.Creator.Username)))
 	ghui.pullRequestDetails.SetCell(3,0,tview.NewTableCell(" [::b]Created: "))
-	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(pullRequestWrapper.PullRequest.CreatedAt.String()))
+	ghui.pullRequestDetails.SetCell(3,1,tview.NewTableCell(ghui.formatDate(pullRequestWrapper.PullRequest.CreatedAt, false)))
 	ghui.pullRequestDetails.SetCell(4,0,tview.NewTableCell(" [::b]Updated: "))
 	ghui.pullRequestDetails.SetCell(4,1,tview.NewTableCell(prettytime.Format(pullRequestWrapper.PullRequest.UpdatedAt)))
 	ghui.pullRequestDetails.SetCell(5,0,tview.NewTableCell(" [::b]First Seen: "))
@@ -436,6 +489,9 @@ func (ghui *UI) updatePullRequestDetails(pullRequestWrapper *PullRequestWrapper)
 		ghui.reviewerTable.SetCell(i, 3, tview.NewTableCell(fmt.Sprintf("[%f[]", pullRequestReviews[0].Score)))
 
 	}
+
+	// Add score details
+
 }
 
 func (ghui *UI) updatePullRequestEntry(pullRequestEntry *PullRequestEntry) {
@@ -457,33 +513,123 @@ func (ghui *UI) updatePullRequestEntry(pullRequestEntry *PullRequestEntry) {
 	// AvailableSpace := width - border (2) + dividers (3 * 6) + Seen (1) + heat pattern (5) + brief status (9) + Date (30) + Repo Name (35) + User (20)
 	availableSpace := width - (2 + 3*6 + 1 + 5 + 9 + 30 + 35 + 20)
 
-	expandedRepoName := padToLen(pruneTo(pullRequestItem.Repo.Name, 33), 35)
 	title := ghui.escapeSquareBracketsInString(pullRequestItem.Title)
-
-	stylingLength := 0
+	var stylingLength = 0
 	if pullRequestWrapper.Deleted {
 		title = "[::s]" + title + "[::-]"
 		stylingLength = 10
 	}
 	expandedTitle := padToLen(title, availableSpace-stylingLength)
 
+	colorizedRepo, stylingLength := formatWithColor(pruneTo(pullRequestItem.Repo.Name,33), ghui.getColorForRepo(pullRequestItem.Repo))
+	expandedRepoName := padToLen(colorizedRepo, 35-stylingLength)
 
-	expandedDate := padToLen(pullRequestItem.UpdatedAt.String(), 30)
+	updatedAt := ghui.formatDate(pullRequestItem.UpdatedAt, true)
+	expandedDate := padToLen(updatedAt, 30)
 	expandedAttributes := padToLen(ghui.getPullRequestReviewStatusString(pullRequestWrapper), 9)
 	expandedSeen := padToLen(seen, 3)
-	expandedUser := padToLen(pullRequestItem.Creator.Username, 20)
+
+	colorizedUser, stylingLength := formatWithColor(pullRequestItem.Creator.Username, ghui.getColorForUser(pullRequestItem.Creator))
+	expandedUser := padToLen(colorizedUser, 20-stylingLength)
 
 	coloringLength, heatPattern := ghui.getHeatPattern(pullRequestWrapper)
 	expandedHeatPattern := padToLen(heatPattern,9-coloringLength)
 
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,0, tview.NewTableCell(expandedSeen))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,1, tview.NewTableCell(expandedHeatPattern))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,2, tview.NewTableCell(expandedAttributes))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,3,tview.NewTableCell(expandedTitle))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,4, tview.NewTableCell(expandedRepoName))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,5, tview.NewTableCell(expandedUser))
-	pullRequestTable.SetCell(pullRequestEntry.tableIndex,6, tview.NewTableCell(expandedDate))
+	cell := tview.NewTableCell(expandedSeen)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,0, cell)
 
+	cell = tview.NewTableCell(expandedHeatPattern)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,1, cell)
+
+	cell = tview.NewTableCell(expandedAttributes)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,2, cell)
+
+	cell = tview.NewTableCell(expandedTitle)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,3, cell)
+
+	cell = tview.NewTableCell(expandedRepoName)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,4, cell)
+
+	cell = tview.NewTableCell(expandedUser)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,5, cell)
+
+	cell = tview.NewTableCell(expandedDate)
+	pullRequestTable.SetCell(pullRequestEntry.tableIndex,6, cell)
+
+}
+
+func stringToColor(str string) tcell.Color {
+
+	hash := 0
+	for _,c := range str {
+		hash = int(c) + ((hash << 5) - hash)
+	}
+
+	colorIndex := int(math.Abs(float64(hash % len(tcell.ColorNames))))
+
+	keys := make([]string,0)
+	for k := range tcell.ColorNames {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	key := keys[colorIndex]
+	return tcell.ColorNames[key]
+
+}
+
+func (ghui *UI)getColorForUser(user *User) tcell.Color {
+
+	if userConfiguration,ok := ghui.userConfigurations[user.Id]; ok {
+		return userConfiguration.color
+	} else {
+		color := stringToColor(user.Username)
+		ghui.userConfigurations[user.Id] = &UserConfiguration{color:color,user: user}
+		return color
+	}
+}
+
+func (ghui *UI)getColorForRepo(repo *Repo) tcell.Color {
+	if repoConfiguration,ok := ghui.repositoryConfigurations[repo.Id]; ok {
+		return repoConfiguration.color
+	} else {
+		color := stringToColor(repo.Name)
+		ghui.repositoryConfigurations[repo.Id] = &RepositoryConfiguration{color:color,repository: repo}
+		return color
+	}
+}
+
+func formatWithColor(username string, color tcell.Color) (string, int) {
+	hexColor := tcell.ColorValues[color]
+	return fmt.Sprintf("[#%06x]%s[::]",hexColor,username), 12
+}
+
+
+func (ghui *UI) addPullRequestTableHeader() {
+
+	pullRequestGroup := ghui.reviewPullRequestGroup
+	pullRequestTable := pullRequestGroup.pullRequestTable
+
+	cell := tview.NewTableCell(" ")
+	cell.SetSelectable(false)
+	pullRequestTable.SetCell(0,0, cell)
+
+	cell = tview.NewTableCell(" [::b]Heat")
+	pullRequestTable.SetCell(0,1, cell)
+
+	cell = tview.NewTableCell(" [::b]Attributes")
+	pullRequestTable.SetCell(0,2, cell)
+
+	cell = tview.NewTableCell(" [::b]Title")
+	pullRequestTable.SetCell(0,3, cell)
+
+	cell = tview.NewTableCell(" [::b]Repository")
+	pullRequestTable.SetCell(0,4, cell)
+
+	cell = tview.NewTableCell(" [::b]User")
+	pullRequestTable.SetCell(0,5, cell)
+
+	cell = tview.NewTableCell(" [::b]Last Active")
+	pullRequestTable.SetCell(0,6, cell)
 }
 
 func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullRequestWrapper) {
@@ -492,30 +638,47 @@ func (ghui *UI)handlePullRequestsUpdates(loadedPullRequestWrappers []*PullReques
 		return
 	}
 
-	selectedIndex := 0
+	selectedIndex := ghui.numRowsForHeader
 	var currentlySelectedEntry *PullRequestEntry = nil
 
 	if len(ghui.reviewPullRequestGroup.pullRequestEntries) > 0 {
 		selectedIndex,_ = ghui.reviewPullRequestGroup.pullRequestTable.GetSelection()
-		currentlySelectedEntry = ghui.reviewPullRequestGroup.pullRequestEntries[selectedIndex]
+		currentlySelectedEntry = ghui.reviewPullRequestGroup.pullRequestEntries[selectedIndex - ghui.numRowsForHeader]
 	}
 
 	pullRequestGroup := ghui.reviewPullRequestGroup
 	pullRequestGroup.pullRequestTable.Clear()
 	pullRequestGroup.pullRequestEntries = make([]*PullRequestEntry, 0)
 
+	ghui.addPullRequestTableHeader()
+
 	for counter, pullRequestWrapper := range loadedPullRequestWrappers {
 
 		if currentlySelectedEntry != nil && pullRequestWrapper.Id == currentlySelectedEntry.pullRequestWrapper.Id {
-			selectedIndex = counter
+			selectedIndex = counter + ghui.numRowsForHeader
 		}
 
-		pullRequestEntry := &PullRequestEntry{pullRequestWrapper: pullRequestWrapper,tableIndex: counter}
+		pullRequestEntry := &PullRequestEntry{pullRequestWrapper: pullRequestWrapper,tableIndex: counter + ghui.numRowsForHeader}
+
+		creator := pullRequestWrapper.PullRequest.Creator
+		if _, ok := ghui.userConfigurations[creator.Id]; !ok {
+			// Add a new user configuration
+			colorForUser := ghui.getColorForUser(creator)
+			ghui.userConfigurations[creator.Id] = &UserConfiguration{color: colorForUser, user: creator}
+		}
+
+		repo := pullRequestWrapper.PullRequest.Repo
+		if _, ok := ghui.repositoryConfigurations[repo.Id]; !ok {
+			// Add a new repo configuration
+			colorForRepo := ghui.getColorForRepo(repo)
+			ghui.repositoryConfigurations[repo.Id] = &RepositoryConfiguration{color: colorForRepo, repository: repo}
+		}
+
 		ghui.updatePullRequestEntry(pullRequestEntry)
 		pullRequestGroup.pullRequestEntries = append(pullRequestGroup.pullRequestEntries, pullRequestEntry)
 	}
 
-	for selectedIndex >= pullRequestGroup.pullRequestTable.GetRowCount() {
+	for selectedIndex >= pullRequestGroup.pullRequestTable.GetRowCount() + ghui.numRowsForHeader {
 		selectedIndex--
 	}
 
@@ -571,7 +734,7 @@ func (ghui *UI) handlePullRequestDeleted(pullRequestWrapper *PullRequestWrapper)
 		if existingPullRequestEntry.pullRequestWrapper.Id == pullRequestWrapper.Id {
 			pullRequestEntry = existingPullRequestEntry
 			pullRequestEntry.pullRequestWrapper = pullRequestWrapper
-			pullRequestEntryIndex = index
+			pullRequestEntryIndex = index-ghui.numRowsForHeader
 		}
 	}
 
