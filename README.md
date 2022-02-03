@@ -2,7 +2,7 @@
 
 # ghmon
 
-'_ghmon_' is a simple command line utility written in Go that monitors your pull requests on Github.  It provides a simple UI to list the PRs that you have opened as well as the ones which you have been requested to review, sorting them according to status, age and other criteria.
+'_ghmon_' is a command line utility written in Go that monitors your pull requests on Github.  It provides a simple UI to list the PRs that you have opened as well as the ones which you have been requested to review, sorting them according to status, age and other criteria.
 
 At scheduled intervals, it will refresh the list of pull requests being monitored and update the UI accordingly.
 
